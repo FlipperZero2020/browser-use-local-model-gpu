@@ -466,7 +466,7 @@ GPU. Budget it; nobody has.
 Each phase ends with a gate. Do not start the next until its gate passes. **Ordering
 principle: the riskiest unknown is also the cheapest to test, so it goes first.**
 
-### Phase 0 — correct the record. No GPU, no browser, no network.
+### Phase 0 — correct the record. ✅ **PASSED 2026-09-01**
 
 `git init`. Pin `browser-use==0.13.8` and `warden @ git+…@v0.3.0` in `requirements.txt`
 (the root cause of this whole divergence was an unpinned `pip install browser-use`). Write
@@ -475,6 +475,30 @@ principle: the riskiest unknown is also the cheapest to test, so it goes first.*
 **Gate:** `version('browser-use')` → `0.13.8`; `CONFIG.ANONYMIZED_TELEMETRY` is False and
 `'posthog' not in sys.modules` after importing `Agent`; the guard raises `TypeError` on a
 0.9.7-era kwarg.
+
+**The gate's middle clause is a false pass, and had to be replaced rather than merely
+run.** Measured: `'posthog' not in sys.modules` after `from browser_use import Agent` is
+`True` *even with telemetry fully enabled*, because the import is lazy and lives inside
+`ProductTelemetry.__init__` — it happens at Agent **construction**. `tools/phase0_gate.py`
+therefore checks the literal wording, then constructs `ProductTelemetry` and asserts the
+client is `None`, and then runs the same probe a third time with telemetry ON as a
+**negative control**, so the two checks are known to differ rather than assumed to.
+
+```
+  [PASS] browser-use is pinned at 0.13.8                    version('browser-use') == '0.13.8'
+  [PASS] warden is the v0.3.0 commit                        0.3.0 @ a252644aa5bd
+  [PASS] zero-cloud after importing Agent                   ANONYMIZED_TELEMETRY=False CLOUD_SYNC=False
+                                                            VERSION_CHECK=False posthog in sys.modules=False
+  [PASS] no PostHog client after ProductTelemetry()         client=None, posthog in sys.modules=False
+  [PASS] the telemetry check discriminates                  with telemetry ON: the plan's literal check still
+                                                            says posthog-in-sys.modules=False (a false pass),
+                                                            while construction yields a live Posthog client
+  [PASS] the guard rejects 0.9.7-era kwargs                 TypeError names max_steps, planner_llm,
+                                                            tool_calling_method, validate_output
+  [PASS] the guard passes every kwarg PLAN.md §4.3 uses     10 accepted, out of 62 real parameters
+
+PHASE 0 GATE: PASSED — 7 of 7 checks
+```
 
 ### Phase 1 — the grammar smoke test. ✅ **PASSED 2026-09-01**
 
@@ -643,12 +667,30 @@ Ordered by how expensive the surprise is.
   request is abandoned but the GPU keeps generating, holding VRAM.
 - **`max_history_items` defaults to `None`** — unbounded. It is the fastest-growing term in
   the context budget and it overflows you mid-task, silently.
-- **`import browser_use` leaks a `/tmp` directory, permanently.** Module-level
-  `DEFAULT_BROWSER_PROFILE = BrowserProfile()` plus a validator that `mkdtemp`s when
-  `user_data_dir` is None. There are **32 such dirs, 2.2 GB**, on this VM right now. A CLI
-  that runs once per task grows this without bound. Clean them in Phase 0 and add a sweep.
-- **`user_data_dir=None` is not "no profile"** — it is a fresh temp profile. And any path
-  containing `chrome` triggers the 718 MB copytree, one-way.
+- **browser-use leaks `/tmp` directories — but not on the import, and not the one this
+  plan named.** ~~`import browser_use` leaks a `/tmp` directory, permanently.~~ **Corrected
+  2026-09-01 by measurement:** a bare `import browser_use` creates **zero** directories,
+  because `browser_use/__init__.py` uses a lazy-import table and never reaches
+  `browser.session`. And the `mkdtemp` validator does not fire for the module-level
+  `DEFAULT_BROWSER_PROFILE = BrowserProfile()` either, because **pydantic does not run an
+  `after` field validator on an unset default** — `BrowserProfile().user_data_dir` is
+  `None`. What is actually true:
+  - `from browser_use import Agent` creates one empty `/tmp/browser-use-downloads-<8hex>`
+    per process, from the `set_default_downloads_path` validator, which `mkdir`s
+    unconditionally. 4 KB, and unavoidable short of moving `TMPDIR`.
+  - Each `BrowserSession(...)` / `Agent(...)` **construction** creates one
+    `/tmp/browser-use-user-data-dir-<8>`, because `BrowserProfile.model_config` sets
+    `revalidate_instances='always'`, so the profile is re-validated on the way into the
+    session and *then* the validator fires. Per construction, not per import.
+  - The count that started this bullet — **32 dirs, 2.2 GB** — was 29 empty 4 KB stubs
+    plus **three 712 MB copies of the real Chrome profile**, cookies and `Login Data`
+    included, sitting world-unreadable but undeleted in `/tmp`. All 32 removed in Phase 0;
+    `tools/sweep_tmp.py` is the sweep, and it covers both prefixes.
+- **`user_data_dir=None` is not "no profile"** — it is a fresh temp profile, and passing it
+  explicitly is not the trigger either way: `session.py` filters `None` kwargs out before
+  the profile is built. Any path containing `chrome` triggers the 718 MB copytree, one-way,
+  and the match is the naive substring `'chrome' in str(user_data_dir).lower()` — which
+  `~/.config/browseruse/profiles/chrome-default`, the profile §4.4 attaches to, contains.
 - **Display detection answers from DRM, not X.** With `DISPLAY` unset, `xrandr` fails but
   the DRM enumerator still returns 1914x916 — so browser-use picks `headless=False` and
   then hangs. This is exactly what a cron job, a systemd unit or a non-login ssh gets.
@@ -662,6 +704,46 @@ Ordered by how expensive the surprise is.
   still recommends it and the superseded plan hands out the exact curl.
 - **Never hand-start anything warden owns, and never `taskkill` a tenant** — it bypasses
   eviction verification, so warden books a ghost and under-admits for 900 s.
+- **Lease-loss detection has a 30-second floor and no bridge lowers it.**
+  `_Heartbeat._run` is `while not self._stop.wait(self.interval)` — it sleeps the whole
+  interval *before* beating, and only a beat's 404 sets `lost_event`. warden has no push
+  channel of any kind. `WardenClient(heartbeat_interval_s=5)` looks like the fix and does
+  nothing: the client uses `lease.heartbeat_interval_s or default`, and warden always
+  sends 30. The **only** lever is a shorter `ttl_s`, through `min(interval, ttl_s/3)`.
+- **`lost_event` never fires when warden is merely unreachable.** The heartbeat swallows
+  `WardenUnreachable` as transient by design, and one such beat can occupy the heartbeat
+  thread for ~240 s (four attempts at a 60 s timeout, plus backoff). Losing warden and
+  losing the lease are different events, and only the second one is observable.
+- **`Task.cancel()` is cooperative and cannot preempt a blocking call.** An agent parked
+  inside `asyncio.to_thread()` around a synchronous POST to ollama does not see the cancel
+  until that POST returns, and a step that catches `CancelledError` broadly swallows it
+  outright. `lease.py` re-fires the cancel once a second, ten times, and stops the instant
+  the holder acknowledges — because a repeat-cancel that outlives the acknowledgement
+  re-marks the task as cancelling and interrupts the release itself.
+- **Do not blanket-convert `CancelledError` into a lease error.** `asyncio.run` turns an
+  *untouched* `CancelledError` back into the `KeyboardInterrupt` it came from, so
+  rewriting a cancellation you did not cause destroys the caller's signal. Convert only
+  the ones you raised, and `uncancel()` only those.
+- **`Agent(enable_signal_handler=...)` defaults to `True`** and installs browser-use's own
+  SIGINT handler, which fights the lease holder's. Anything holding a lease must pass it
+  `False`.
+- **An empty-string env var is not "unset" to browser-use, and is not harmless.** The
+  parser is `os.getenv(name, default).lower()[:1] in 'ty1'`, and `'' in 'ty1'` is `True` in
+  Python — so a blank `ANONYMIZED_TELEMETRY` reads as **enabled**. Worse, `FlatEnvConfig`
+  is a pydantic `BaseSettings` that cannot parse `''` as a bool, so a blank value makes
+  `import browser_use` raise a `ValidationError` outright. `os.environ.setdefault` sees
+  neither case; treat blank as unset.
+- **browser-use calls `load_dotenv()` at import, from five different modules**, and
+  `find_dotenv` walks up from `os.getcwd()` when `__main__` has no `__file__` — so
+  `python -c`, a REPL, a notebook and most debuggers pick up whatever `.env` is nearest the
+  *working directory*, not the script. It does not override an existing variable, which is
+  the second reason the zero-cloud block has to run first: applied first it wins, applied
+  after it is merely redundant. This directory's own `.env` still declares
+  `OLLAMA_MODEL=qwen3-32k:8b` — **a model `policy.json` does not declare**, so warden
+  cannot lease it and nothing would notice until an unleased call succeeded.
+- **`ProductTelemetry` is a process-wide singleton that decides once.** Its posthog client
+  is chosen at first construction — the first `Agent`, `Tools`, `Registry` or MCP server in
+  the process — so flipping `ANONYMIZED_TELEMETRY` after that has no effect at all.
 - **Never edit `policy.json` with a regex**, and remember it is re-read on every acquire — a
   bad edit binds immediately, and a `PolicyError` takes out every workload at once.
 - **Prompt injection, holding your real logins — the top risk in this project.** The agent

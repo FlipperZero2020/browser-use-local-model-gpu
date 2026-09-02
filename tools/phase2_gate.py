@@ -61,10 +61,14 @@ EXPECTED_NUM_CTX = 4096
 #: load that shows in neither /api/ps nor warden's tenants.
 FOREIGN_BASELINE_MAX = 2600
 
+OLLAMA_ENDPOINT = 'http://192.168.1.111:11434'
 HOLD_S = 600.0
 SAMPLE_S = 15.0
 #: idle_linger_s (180) + evict_verify_timeout_s (30) + slack for the 5 s engine tick.
-FREED_WAIT_S = 300.0
+FREED_WAIT_S = 330.0
+#: policy.json's global. A teardown counts as verified when at least this fraction of the
+#: expected MiB observably comes back; below it, warden books the shortfall as a ghost.
+VERIFY_FREED_FRACTION = 0.8
 
 results: list[tuple[str, str, str]] = []
 log = logging.getLogger('phase2')
@@ -100,6 +104,11 @@ async def preflight(warden: AsyncWardenClient) -> dict:
 		problems.append(f'ghost_mib {v.get("ghost_mib")} — the book is already under-admitting')
 	if status.get('leases'):
 		problems.append(f'{len(status["leases"])} lease(s) already open')
+	if v.get('committed_mib'):
+		note('preflight: the card was not idle',
+		     f'committed {v.get("committed_mib")} MiB, tenants '
+		     f'{[t.get("workload_id") for t in status.get("tenants") or []]} — a warm start, so '
+		     f'the cold-acquire path is not exercised by this run')
 	if problems:
 		raise SystemExit('preflight refused to start:\n  ' + '\n  '.join(problems))
 	return status
@@ -241,6 +250,7 @@ async def gate_hold_and_free(warden: AsyncWardenClient, baseline: dict, hold_s: 
 	samples: list[dict] = []
 	lease_id = ''
 	t0 = time.monotonic()
+	max_event_id = await max_event(warden)
 
 	async with hold(WORKLOAD, reason='browsin phase 2 gates 1-2 (ten-minute hold)',
 	                handle_signals=False) as card:
@@ -281,40 +291,72 @@ async def gate_hold_and_free(warden: AsyncWardenClient, baseline: dict, hold_s: 
 	       f'{samples[-1]["committed"]} MiB, ghost stayed '
 	       f'{max(s["ghost"] or 0 for s in samples)}')
 
-	# ── gate 2 ──────────────────────────────────────────────────────────────
-	print(f'  released; waiting up to {FREED_WAIT_S:.0f}s for idle_linger + evict verify…',
-	      flush=True)
+	await gate_freed(warden, since_id=max_event_id, baseline=baseline)
+
+
+async def max_event(warden: AsyncWardenClient) -> int:
+	"""The newest event id, so a later scan can ignore everything that came before.
+
+	Without this the gate matches an `evict_verified` from a *previous* run and reports a
+	pass in about a second — which is exactly what the first version of it did.
+	"""
+	events = await warden.events(limit=5)
+	return max((int(e.get('id') or 0) for e in events), default=0)
+
+
+async def gate_freed(warden: AsyncWardenClient, *, since_id: int, baseline: dict) -> None:
+	"""Gate 2. Watches the teardown that follows a release — it does not cause one.
+
+	Release does **not** free VRAM. `_close_lease` marks the tenant `lingering` and leaves
+	it READY; `_begin_stop` only runs `idle_linger_s` (180 s for both ollama workloads)
+	later, and `_poll_stopping` then has up to `evict_verify_timeout_s` (30 s) to see the
+	memory come back. So the whole observation is ~210 s wide and there is nothing to do
+	but wait for it.
+	"""
+	print(f'  watching for the teardown (events after id {since_id}); '
+	      f'idle_linger 180s + evict verify 30s…', flush=True)
 	deadline = time.monotonic() + FREED_WAIT_S
-	# `_poll_stopping` only emits once the tenant has actually been torn down, which is
-	# idle_linger_s after the last lease closed — so this waits, it does not poll fast.
-	verified = unverified = None
+	seen: dict[str, dict] = {}
 	while time.monotonic() < deadline:
-		events = await warden.events(limit=200)
-		for ev in events:
-			if ev.get('workload_id') != WORKLOAD:
+		for ev in await warden.events(limit=300):
+			if int(ev.get('id') or 0) <= since_id or ev.get('workload_id') != WORKLOAD:
 				continue
-			if ev.get('kind') == 'evict_verified' and verified is None:
-				verified = ev
-			if ev.get('kind') == 'evict_unverified' and unverified is None:
-				unverified = ev
-		if verified or unverified:
+			kind = str(ev.get('kind'))
+			if kind in ('lingering', 'stopping', 'evict_verified', 'evict_unverified',
+			            'stopped', 'lost_abandoned') and kind not in seen:
+				seen[kind] = ev
+				print(f'    event {ev["id"]} {kind}: {ev.get("detail") or ev.get("fields")}',
+				      flush=True)
+		if 'stopped' in seen or 'evict_unverified' in seen or 'lost_abandoned' in seen:
 			break
 		await asyncio.sleep(10.0)
 
 	status = await warden.status()
 	v = vram(status)
-	base_free = (baseline.get('vram') or {}).get('free_mib') or 0
-	back = (v.get('free_mib') or 0) >= base_free - 256
-	ok = bool(verified) and not unverified and not v.get('ghost_mib') and back
-	detail = (f'free {base_free}→{v.get("free_mib")} MiB, ghost {v.get("ghost_mib")}, '
-	          f'committed {v.get("committed_mib")}')
-	if verified:
-		detail += (f'; evict_verified: {verified.get("freed_mib")} of an expected '
-		           f'{verified.get("expected_mib")} MiB came back')
-	elif unverified:
-		detail += f'; evict_unverified booked {unverified.get("ghost_mib")} MiB as a ghost'
-	else:
-		detail += f'; no evict_verified within {FREED_WAIT_S:.0f}s (tenant may still be lingering)'
+	tenants = [t.get('workload_id') for t in status.get('tenants') or []]
+	resident = await asyncio.to_thread(_ps_summary, baseline['endpoint'])
+
+	verified = seen.get('evict_verified')
+	fields = (verified or {}).get('fields') or {}
+	freed, expected = fields.get('freed_mib'), fields.get('expected_mib')
+	fraction = (freed / expected) if (freed and expected) else None
+
+	ok = (
+		verified is not None
+		and 'evict_unverified' not in seen
+		and 'lost_abandoned' not in seen
+		and not v.get('ghost_mib')
+		and not v.get('committed_mib')
+		and WORKLOAD not in tenants
+		and not resident
+		and fraction is not None and fraction >= VERIFY_FREED_FRACTION
+	)
+	detail = (f'saw {sorted(seen)}; '
+	          + (f'evict_verified freed {freed} of an expected {expected} MiB '
+	             f'({fraction:.2f} >= verify_freed_fraction {VERIFY_FREED_FRACTION})'
+	             if fraction is not None else 'no evict_verified with a freed_mib field')
+	          + f'; after teardown: committed={v.get("committed_mib")} ghost={v.get("ghost_mib")} '
+	            f'free={v.get("free_mib")} tenants={tenants} /api/ps={resident}')
 	record('2. release frees within verify_freed_fraction and books no ghost', ok, detail)
 
 
@@ -322,7 +364,10 @@ async def gate_hold_and_free(warden: AsyncWardenClient, baseline: dict, hold_s: 
 async def main() -> int:
 	ap = argparse.ArgumentParser(description=__doc__)
 	ap.add_argument('--hold-s', type=float, default=HOLD_S)
-	ap.add_argument('--only', default='', help='comma-separated: lost,sigint,sigterm,assert,hold')
+	ap.add_argument('--only', default='',
+	                help='comma-separated: lost,sigint,sigterm,assert,hold,freed')
+	ap.add_argument('--since-event-id', type=int, default=0,
+	                help='for --only freed: ignore events at or below this id')
 	args = ap.parse_args()
 	only = {s.strip() for s in args.only.split(',') if s.strip()}
 
@@ -333,6 +378,7 @@ async def main() -> int:
 	warden = AsyncWardenClient.from_env()
 	sync = WardenClient.from_env()
 	baseline = await preflight(warden)
+	baseline['endpoint'] = OLLAMA_ENDPOINT
 
 	steps = [
 		('lost', lambda: gate_lost(warden, sync)),
@@ -340,6 +386,9 @@ async def main() -> int:
 		('sigterm', lambda: asyncio.to_thread(gate_signal, sync, signal.SIGTERM)),
 		('assert', lambda: gate_assertions(warden)),
 		('hold', lambda: gate_hold_and_free(warden, baseline, args.hold_s)),
+		# Standalone: watch a teardown that is already in flight, e.g. after a lease this
+		# gate did not take. `--since-event-id` scopes the scan.
+		('freed', lambda: gate_freed(warden, since_id=args.since_event_id, baseline=baseline)),
 	]
 	for name, step in steps:
 		if only and name not in only:

@@ -331,45 +331,66 @@ class Card:
 # ── signals ──────────────────────────────────────────────────────────────────
 @contextlib.contextmanager
 def _signal_cancellation(loop: asyncio.AbstractEventLoop, task: asyncio.Task,
-                         seen: dict[str, Any]):
+                         seen: dict[str, Any], release_sync: Callable[[], None]):
 	"""SIGINT and SIGTERM cancel `task` instead of killing the process where it stands.
 
-	`loop.add_signal_handler` rather than `signal.signal`, because it runs the callback
-	*inside* the loop: the `async with` unwinds, warden's release runs, and the card comes
-	back. A `signal.signal` handler raising `SystemExit` escapes `run_until_complete` and
-	leaves the release to `atexit`, which is a strictly worse place for it to happen.
+	Two layers, because one is not enough.
 
-	A second signal restores the default disposition and re-raises, so an impatient
-	operator is never trapped — the lease then falls to `atexit`, and failing that to the
-	TTL. Handlers are removed on the way out, so a REPL keeps its ordinary Ctrl-C.
+	**In the loop.** `loop.add_signal_handler` rather than `signal.signal`, because it runs
+	the callback *inside* the loop: the `async with` unwinds, warden's release runs, and
+	the card comes back. A `signal.signal` handler raising `SystemExit` also works, but it
+	does the cleanup during `Runner.close()` teardown and gives no control over the exit
+	code.
+
+	**On the main thread.** A loop callback cannot run while the loop is wedged — parked in
+	`asyncio.to_thread()` around a blocking POST, which is the normal state of a browser
+	agent mid-step. So a plain handler goes on top of it (both fire: overwriting asyncio's
+	`_sighandler_noop` leaves the wakeup-fd write intact). It does nothing on the first
+	signal, leaving the graceful path to work. On the **second** it restores the default
+	disposition, releases the lease synchronously, and re-raises — so an impatient operator
+	is never trapped into a `SIGKILL`, which is the one exit nothing can cover.
+
+	Installed *before* the acquire, not after. A SIGTERM during a ~190 s cold load would
+	otherwise hit the default disposition, which runs neither `finally` nor `atexit` — the
+	precise way Phase 1 stranded a lease. Handlers are removed on the way out, so a
+	REPL keeps its ordinary Ctrl-C.
 	"""
-	def handle(signum: int) -> None:
-		name = signal.Signals(signum).name
+	def graceful(signum: int) -> None:
 		if seen.get('signal') is not None:
-			log.warning('%s again — giving up on a clean release; the TTL will collect it', name)
-			with contextlib.suppress(RuntimeError, ValueError):
-				loop.remove_signal_handler(signum)
-			signal.signal(signum, signal.SIG_DFL)
-			signal.raise_signal(signum)
-			return
-		seen['signal'] = name
-		log.warning('%s — cancelling the run and giving the card back', name)
+			return  # the plain handler below owns escalation
+		seen['signal'] = signal.Signals(signum).name
+		log.warning('%s — cancelling the run and giving the card back', seen['signal'])
 		task.cancel()
 
-	installed: list[int] = []
+	def plain(signum: int, _frame: Any) -> None:
+		seen['signals_seen'] = seen.get('signals_seen', 0) + 1
+		if seen['signals_seen'] < 2:
+			return  # first one: let the loop callback do it properly
+		name = signal.Signals(signum).name
+		log.warning('%s again — releasing synchronously and stopping now', name)
+		signal.signal(signum, signal.SIG_DFL)
+		try:
+			release_sync()
+		finally:
+			signal.raise_signal(signum)
+
+	installed: list[tuple[int, Any]] = []
 	for signum in (signal.SIGINT, signal.SIGTERM):
 		try:
-			loop.add_signal_handler(signum, handle, signum)
+			loop.add_signal_handler(signum, graceful, signum)
 		except (NotImplementedError, RuntimeError, ValueError):
 			# Not the main thread, or a platform without it. warden's atexit still covers
-			# the ordinary exits; only the SIGTERM case is lost, so say so.
-			log.debug('could not install a handler for %s', signal.Signals(signum).name)
+			# the ordinary exits; only the bare-SIGTERM case is lost.
+			log.debug('could not install a loop handler for %s', signal.Signals(signum).name)
 			continue
-		installed.append(signum)
+		previous = signal.signal(signum, plain)
+		installed.append((signum, previous))
 	try:
 		yield
 	finally:
-		for signum in installed:
+		for signum, previous in installed:
+			with contextlib.suppress(RuntimeError, ValueError, TypeError):
+				signal.signal(signum, previous)
 			with contextlib.suppress(RuntimeError, ValueError):
 				loop.remove_signal_handler(signum)
 
@@ -427,73 +448,88 @@ async def hold(
 		if on_state is not None:
 			on_state(view)
 
-	seen: dict[str, Any] = {'signal': None, 'lost': False}
+	seen: dict[str, Any] = {'signal': None, 'lost': False, 'lease_id': None}
 	watcher: _LostWatcher | None = None
 
-	async with warden.lease(
-		workload, reason=reason, ttl_s=ttl_s, priority=priority,
-		timeout_s=timeout_s, may_evict=may_evict, on_state=narrate,
-		# We convert loss into cancellation ourselves and re-raise LeaseLost from there,
-		# so the library's own exit-time raise would only ever be a duplicate.
-		raise_if_lost=False,
-	) as held:
-		card = Card(workload=workload, model_tag=normalise_tag(workload),
-		            endpoint=held.endpoint, leased=True, held=held, lease=held.lease)
+	def release_sync() -> None:
+		"""Blocking DELETE, safe from a signal handler. Idempotent; a 404 is not an error."""
+		lease_id = seen.get('lease_id')
+		if not lease_id:
+			return
+		with contextlib.suppress(Exception):
+			warden.sync.release(lease_id)
 
-		def on_lost() -> None:
-			if not seen['lost']:
-				seen['lost'] = True
-				card.lost.set()
-				log.error('lease %s lost — cancelling the run', held.lease_id[:8])
-			# Not guarded: the watcher re-fires because one cancel can be swallowed, and
-			# cancelling a task that has already finished is a harmless no-op.
-			task.cancel()
+	def remember(view: Lease) -> None:
+		# The acquire snapshot is the earliest moment a lease id exists, and the last
+		# resort above needs it before anything can go wrong with the wait.
+		if view.lease_id:
+			seen['lease_id'] = view.lease_id
+		narrate(view)
 
-		try:
-			if verify:
-				# Off the loop: two blocking GETs, and the heartbeat thread keeps beating
-				# through them either way.
-				await asyncio.to_thread(assert_resident, card.endpoint, workload,
-				                        exact=exact_residency)
-				if num_ctx is not None:
-					card.num_ctx = await asyncio.to_thread(
-						assert_context_window, card.endpoint, workload, num_ctx)
+	try:
+		with contextlib.ExitStack() as stack:
+			if handle_signals:
+				stack.enter_context(_signal_cancellation(loop, task, seen, release_sync))
 
-			watcher = _LostWatcher(held.lost_event, loop, on_lost)
-			watcher.start()
+			async with warden.lease(
+				workload, reason=reason, ttl_s=ttl_s, priority=priority,
+				timeout_s=timeout_s, may_evict=may_evict, on_state=remember,
+				# We convert loss into cancellation ourselves and re-raise LeaseLost from
+				# there, so the library's own exit-time raise would only be a duplicate.
+				raise_if_lost=False,
+			) as held:
+				seen['lease_id'] = held.lease_id
+				card = Card(workload=workload, model_tag=normalise_tag(workload),
+				            endpoint=held.endpoint, leased=True, held=held, lease=held.lease)
 
-			with contextlib.ExitStack() as stack:
-				if handle_signals:
-					stack.enter_context(_signal_cancellation(loop, task, seen))
-				yield card
+				def on_lost() -> None:
+					if not seen['lost']:
+						seen['lost'] = True
+						card.lost.set()
+						log.error('lease %s lost — cancelling the run', held.lease_id[:8])
+					# Not guarded: the watcher re-fires because one cancel can be
+					# swallowed, and cancelling a finished task is a harmless no-op.
+					task.cancel()
 
-		except asyncio.CancelledError:
-			# Order matters. Stop the watcher before anything else, or its repeat-cancel
-			# re-marks this task as cancelling and the release below — an `await` — is
-			# interrupted before it can give the card back.
-			if watcher is not None:
-				watcher.stop()
-			if not (seen['lost'] or seen['signal']):
-				# Somebody else cancelled us. Leave the cancellation intact and let it
-				# propagate: rewriting it would destroy their signal, and `asyncio.run`
-				# turns an untouched CancelledError back into the KeyboardInterrupt it
-				# came from.
-				raise
-			# Ours. Clear it so the release can await, then say what actually happened.
-			task.uncancel()
-			if seen['lost']:
-				raise LeaseLost(
-					f'lease {held.lease_id} for {workload} was revoked while it was held; '
-					f'the run was cancelled rather than left talking to an unloaded model',
-					state='revoked', lease_id=held.lease_id,
-				) from None
-			raise Interrupted(
-				f'{seen["signal"]} during {workload}; the lease was released',
-				signal=seen['signal'],
+				try:
+					if verify:
+						# Off the loop: two blocking GETs, and the heartbeat thread keeps
+						# beating through them either way.
+						await asyncio.to_thread(assert_resident, card.endpoint, workload,
+						                        exact=exact_residency)
+						if num_ctx is not None:
+							card.num_ctx = await asyncio.to_thread(
+								assert_context_window, card.endpoint, workload, num_ctx)
+
+					watcher = _LostWatcher(held.lost_event, loop, on_lost)
+					watcher.start()
+					yield card
+				finally:
+					if watcher is not None:
+						watcher.stop()
+
+	except asyncio.CancelledError:
+		# Order matters. Stop the watcher first, or its repeat-cancel re-marks this task
+		# as cancelling and interrupts the release that is still unwinding.
+		if watcher is not None:
+			watcher.stop()
+		if not (seen['lost'] or seen['signal']):
+			# Somebody else cancelled us. Leave the cancellation intact and let it
+			# propagate: rewriting it would destroy their signal, and `asyncio.run` turns
+			# an untouched CancelledError back into the KeyboardInterrupt it came from.
+			raise
+		# Ours. Clear it so anything still unwinding can await, then say what happened.
+		task.uncancel()
+		if seen['lost']:
+			raise LeaseLost(
+				f'lease {seen["lease_id"]} for {workload} was revoked while it was held; '
+				f'the run was cancelled rather than left talking to an unloaded model',
+				state='revoked', lease_id=seen['lease_id'],
 			) from None
-		finally:
-			if watcher is not None:
-				watcher.stop()
+		raise Interrupted(
+			f'{seen["signal"]} during {workload}; the lease was released',
+			signal=seen['signal'],
+		) from None
 
 
 async def probe(client: AsyncWardenClient | None = None) -> dict:
