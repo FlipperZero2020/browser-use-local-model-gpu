@@ -7,7 +7,10 @@ Three checks, verbatim from the plan:
 
   * `version('browser-use')` -> `0.13.8`
   * `CONFIG.ANONYMIZED_TELEMETRY` is False and `'posthog' not in sys.modules` after
-    importing `Agent`
+    importing `Agent` — checked as written, and then checked properly, because **as
+    written it is a false pass**: measured 2026-09-01, posthog is absent from
+    `sys.modules` after that import even with telemetry fully ON. The import is lazy and
+    lives inside `ProductTelemetry.__init__`, so it happens at Agent *construction*.
   * the guard raises `TypeError` on a 0.9.7-era kwarg
 
 Plus two the plan asks for elsewhere: the warden pin (§2) and the `/tmp` leak (§7).
@@ -19,6 +22,8 @@ whole claim is about what happens on a cold `import browser_use`.
 from __future__ import annotations
 
 import importlib.metadata as md
+import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -73,35 +78,80 @@ except md.PackageNotFoundError:
 # ── 2. zero cloud, in a cold process ─────────────────────────────────────────
 PROBE = r'''
 import json, sys
-import browsin                      # applies the env block, imports no browser_use
+IMPORT_BROWSIN
 from browser_use import Agent       # the import under test
 from browser_use.config import CONFIG
+from browser_use.telemetry.service import ProductTelemetry
+after_import = 'posthog' in sys.modules          # the gate's literal wording
+client = getattr(ProductTelemetry(), '_posthog_client', 'missing')   # where it is decided
 json.dump({
     'ANONYMIZED_TELEMETRY': bool(CONFIG.ANONYMIZED_TELEMETRY),
     'BROWSER_USE_CLOUD_SYNC': bool(CONFIG.BROWSER_USE_CLOUD_SYNC),
     'BROWSER_USE_VERSION_CHECK': bool(CONFIG.BROWSER_USE_VERSION_CHECK),
-    'posthog_imported': 'posthog' in sys.modules,
+    'posthog_after_import': after_import,
+    'posthog_after_construction': 'posthog' in sys.modules,
+    'posthog_client': None if client is None else type(client).__name__,
     'agent': Agent.__module__ + '.' + Agent.__name__,
 }, sys.stdout)
 '''
-proc = subprocess.run([sys.executable, '-c', PROBE], capture_output=True, text=True, cwd=ROOT)
-if proc.returncode != 0:
-	record('zero-cloud after importing Agent', False,
-	       f'probe exited {proc.returncode}: {proc.stderr.strip()[-400:]}')
-else:
-	import json
 
-	probe = json.loads(proc.stdout)
+
+def run_probe(env: dict[str, str] | None, *, with_browsin: bool) -> dict:
+	source = PROBE.replace(
+		'IMPORT_BROWSIN',
+		'import browsin  # applies the env block, imports no browser_use'
+		if with_browsin else 'pass  # deliberately NOT applying the env block',
+	)
+	child = dict(os.environ)
+	# The probe must not inherit this process's own zero-cloud state.
+	for name in ('ANONYMIZED_TELEMETRY', 'BROWSER_USE_CLOUD_SYNC', 'BROWSER_USE_VERSION_CHECK',
+	             'BROWSER_USE_DISABLE_EXTENSIONS', 'BROWSER_USE_CALCULATE_COST'):
+		child.pop(name, None)
+	child.update(env or {})
+	proc = subprocess.run([sys.executable, '-c', source], capture_output=True, text=True,
+	                      cwd=ROOT, env=child)
+	if proc.returncode != 0:
+		raise RuntimeError(f'probe exited {proc.returncode}: {proc.stderr.strip()[-400:]}')
+	return json.loads(proc.stdout)
+
+
+try:
+	probe = run_probe(None, with_browsin=True)
+except RuntimeError as err:
+	record('zero-cloud after importing Agent', False, str(err))
+	probe = {}
+else:
 	ok = (not probe['ANONYMIZED_TELEMETRY']
 	      and not probe['BROWSER_USE_CLOUD_SYNC']
 	      and not probe['BROWSER_USE_VERSION_CHECK']
-	      and not probe['posthog_imported'])
+	      and not probe['posthog_after_import'])
 	record('zero-cloud after importing Agent', ok,
 	       f'ANONYMIZED_TELEMETRY={probe["ANONYMIZED_TELEMETRY"]} '
 	       f'CLOUD_SYNC={probe["BROWSER_USE_CLOUD_SYNC"]} '
 	       f'VERSION_CHECK={probe["BROWSER_USE_VERSION_CHECK"]} '
-	       f'posthog in sys.modules={probe["posthog_imported"]} '
+	       f'posthog in sys.modules={probe["posthog_after_import"]} '
 	       f'({probe["agent"]})')
+
+	# The check the plan's wording was reaching for. posthog is imported inside
+	# ProductTelemetry.__init__, so construction is where the decision lands.
+	record('no PostHog client after ProductTelemetry() is constructed',
+	       probe['posthog_client'] is None and not probe['posthog_after_construction'],
+	       f'client={probe["posthog_client"]}, '
+	       f'posthog in sys.modules={probe["posthog_after_construction"]}')
+
+# A negative control, so the check above is known to have teeth: run the same probe with
+# telemetry ON and confirm the plan's literal wording still passes while the real check
+# fails. Without this the two checks are indistinguishable from a pair that always pass.
+try:
+	hot = run_probe({'ANONYMIZED_TELEMETRY': 'true'}, with_browsin=False)
+except RuntimeError as err:
+	record('the telemetry check discriminates', False, str(err))
+else:
+	record('the telemetry check discriminates',
+	       not hot['posthog_after_import'] and hot['posthog_client'] == 'Posthog',
+	       f'with telemetry ON: the plan\'s literal check still says '
+	       f'posthog-in-sys.modules={hot["posthog_after_import"]} (a false pass), while '
+	       f'construction yields a live {hot["posthog_client"]} client')
 
 # ── 3. the **kwargs guard ────────────────────────────────────────────────────
 from browsin.agent import check_agent_kwargs, valid_agent_kwargs  # noqa: E402

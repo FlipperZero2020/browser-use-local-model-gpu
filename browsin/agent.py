@@ -32,9 +32,17 @@ RETIRED: dict[str, str] = {
 	'max_steps': 'moved to Agent.run(max_steps=...), whose default is 500',
 	'tool_calling_method': 'gone — the Ollama path uses format=<json schema>, never tools=',
 	'message_context': 'renamed; see extend_system_message / override_system_message',
-	'browser': 'gone with Playwright; pass browser_session=BrowserSession(cdp_url=...)',
-	'browser_context': 'gone with Playwright; pass browser_session=...',
+	'browser_context': 'gone with Playwright; pass browser_session=BrowserSession(cdp_url=...)',
 	'page': 'gone with Playwright',
+}
+
+#: Names that are still *valid* but are deprecated aliases, so the guard cannot help:
+#: passing one is accepted. `browser` and `controller` raise a ValidationError if their
+#: modern half is also given (service.py:290), which is the good case; `skills` does not.
+ALIASES: dict[str, str] = {
+	'browser': 'browser_session',
+	'controller': 'tools',
+	'skills': 'skills',
 }
 
 #: The overrides PLAN.md §4.3 argues for, with the library default each one replaces.
@@ -87,10 +95,15 @@ def check_agent_kwargs(kwargs: dict[str, Any]) -> None:
 def checked_agent(**kwargs: Any) -> Agent:
 	"""`Agent(**kwargs)`, but a typo or a stale parameter is an error, not a no-op.
 
-	One caveat this guard cannot cover: a name that is *valid* but whose meaning moved.
-	`enable_signal_handler` defaults to True and installs browser-use's own SIGINT
-	handler, which would fight `browsin.lease`'s. Pass it False from anything that holds
-	a lease — `PLAN_DEFAULTS` does.
+	Two caveats this guard cannot cover, both about names that are *valid* but whose
+	meaning moved:
+
+	* `enable_signal_handler` defaults to True and installs browser-use's own SIGINT
+	  handler, which would fight `browsin.lease`'s. Pass it False from anything that
+	  holds a lease — `PLAN_DEFAULTS` does.
+	* The deprecated aliases in `ALIASES` are in the signature, so passing `browser=` or
+	  `controller=` is accepted here and only browser-use's own validator objects, and
+	  only when both halves are given.
 	"""
 	check_agent_kwargs(kwargs)
 	return Agent(**kwargs)

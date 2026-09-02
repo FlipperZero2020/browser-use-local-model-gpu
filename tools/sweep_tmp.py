@@ -14,7 +14,13 @@ Two different code paths make these, and only one of them is cheap:
   kwargs does. Those dirs stay ~4 KB stubs.
 * `profile.py:858` — `_copy_profile()` copytrees a real Chrome profile into a fresh temp
   dir whenever `user_data_dir` looks like Chrome's. Those are the 712 MB ones; there
-  were three of them, in 2.1 GB across 32 dirs, when this VM was first swept.
+  were three of them, in 2.1 GB across 32 dirs, when this VM was first swept. The match
+  is the naive substring `'chrome' in str(user_data_dir).lower()`, and
+  `~/.config/browseruse/profiles/chrome-default` contains it.
+* `profile.py:471` — `browser-use-downloads-<8hex>`, from the `set_default_downloads_path`
+  validator, which mkdirs unconditionally. This one *does* fire on the module-level
+  `DEFAULT_BROWSER_PROFILE`, so it is one 4 KB dir per process that imports
+  `browser_use.browser.session` — i.e. anything touching `Agent` or `BrowserSession`.
 
 Attaching over CDP (PLAN.md §4.4) avoids both, because `browser_profile` is ignored
 entirely when `browser_session` is passed.
@@ -31,7 +37,7 @@ import shutil
 import sys
 import time
 
-PATTERN = "browser-use-user-data-dir-*"
+PATTERNS = ("browser-use-user-data-dir-*", "browser-use-downloads-*")
 TMP = pathlib.Path("/tmp")
 
 
@@ -64,7 +70,8 @@ def main(argv: list[str] | None = None) -> int:
     now = time.time()
     victims: list[tuple[pathlib.Path, int]] = []
     skipped = 0
-    for path in sorted(TMP.glob(PATTERN)):
+    candidates = sorted({p for pattern in PATTERNS for p in TMP.glob(pattern)})
+    for path in candidates:
         # Belt and braces: resolve() and re-check the parent, so a symlink called
         # /tmp/browser-use-user-data-dir-x pointing at $HOME cannot be followed.
         if not path.is_dir() or path.is_symlink() or path.resolve().parent != TMP:
