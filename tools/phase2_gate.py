@@ -48,6 +48,8 @@ from browsin.lease import (  # noqa: E402
 	assert_context_window,
 	assert_resident,
 	hold,
+	normalise_tag,
+	resident_models,
 )
 
 WORKLOAD = 'ollama:qwen3:8b'
@@ -126,18 +128,29 @@ async def gate_lost(warden: AsyncWardenClient, sync: WardenClient) -> None:
 
 	t0 = time.monotonic()
 	interval = 30.0  # replaced from the lease view below; needed if acquire itself fails
+	held_ok = False
+	killer: asyncio.Task | None = None
 	try:
 		async with hold(WORKLOAD, reason='browsin phase 2 gate 5 (lost_event)',
 		                handle_signals=False) as card:
 			interval = card.heartbeat_interval_s or 30.0
+			held_ok = True
 			print(f'  held after {time.monotonic() - t0:.1f}s; heartbeat every {interval:.0f}s',
 			      flush=True)
-			asyncio.create_task(kill_it(card.held.lease_id))
+			killer = asyncio.create_task(kill_it(card.held.lease_id))
 			# Long enough for several heartbeats. If the bridge does not work we sit here,
 			# and the gate fails on the timeout rather than on a wrong answer.
 			await asyncio.sleep(4 * interval + 30)
 	except LeaseLost as err:
-		elapsed = time.monotonic() - killed_at.get('t', t0)
+		# A LeaseLost that arrives before the lease was ever granted — warden restarting
+		# during wait_active, say — would otherwise be graded against t0 and reported as a
+		# fast cancel. The gate must refuse to grade a run it did not set up.
+		if not held_ok or 't' not in killed_at:
+			record('5. lost_event fires and cancels within one heartbeat', False,
+			       f'INCONCLUSIVE: the lease was never {"granted" if not held_ok else "released by this gate"}, '
+			       f'so nothing tested the bridge. LeaseLost: {str(err)[:150]}')
+			return
+		elapsed = time.monotonic() - killed_at['t']
 		ok = elapsed <= interval + 10.0
 		record('5. lost_event fires and cancels within one heartbeat',
 		       ok, f'cancelled {elapsed:.1f}s after the lease was released out from under it '
@@ -147,6 +160,12 @@ async def gate_lost(warden: AsyncWardenClient, sync: WardenClient) -> None:
 		record('5. lost_event fires and cancels within one heartbeat', False,
 		       'the task was cancelled but hold() did not convert it into LeaseLost')
 		return
+	finally:
+		# create_task is fire-and-forget: a release that raised would die inside the task
+		# and the gate would blame the bridge for never firing.
+		if killer is not None and killer.done() and killer.exception() is not None:
+			record('5. the gate could release the lease out from under the holder', False,
+			       f'the kill task raised {killer.exception()!r} — gate 5 above tested nothing')
 	record('5. lost_event fires and cancels within one heartbeat', False,
 	       'the hold ran to completion — lost_event never reached the loop')
 
@@ -182,11 +201,20 @@ def gate_signal(sync: WardenClient, signum: int) -> None:
 		print(f'    child exited {proc.returncode}: {out.strip()!r}', flush=True)
 
 		released = sync.get(lease_id)
-		gone = released is None or released.terminal
 		said_so = f'RELEASED_ON_SIGNAL {name}' in out
-		record(f'3. {name} mid-hold releases cleanly', gone and said_so and proc.returncode == 0,
-		       f'child exited {proc.returncode} saying {out.strip()!r}; warden now reports the '
-		       f'lease as {"gone" if released is None else released.state}')
+		# `None` means warden has no RECORD of the lease — which client.py says almost
+		# always means warden restarted, not that anyone released it. warden keeps 500
+		# closed leases, so a real release is readable as state='released'. Accepting None
+		# would let a warden restart look like a pass.
+		if released is None:
+			record(f'3. {name} mid-hold releases cleanly', False,
+			       f'INCONCLUSIVE: warden has no record of {lease_id[:8]} — it probably '
+			       f'restarted, so nothing here proves a release. Child said {out.strip()!r}')
+			return
+		record(f'3. {name} mid-hold releases cleanly',
+		       released.state == 'released' and said_so and proc.returncode == 0,
+		       f'child exited {proc.returncode} saying {out.strip()!r}; warden reports the '
+		       f'lease as {released.state}')
 	finally:
 		if proc.poll() is None:
 			proc.kill()
@@ -206,11 +234,20 @@ async def gate_assertions(warden: AsyncWardenClient) -> None:
 		print(f'  resident: {json.dumps(await asyncio.to_thread(_ps_summary, card.endpoint))}',
 		      flush=True)
 
+		# Establish the premise first: the wrong tag must genuinely be absent, and the
+		# right one present. Otherwise a NotResident raised for one of its *other* reasons
+		# — nothing resident, or something loaded alongside — would be counted as proof.
+		resident = {normalise_tag(str(m.get('model') or m.get('name') or ''))
+		            for m in await asyncio.to_thread(resident_models, card.endpoint)}
+		premise = normalise_tag(WORKLOAD) in resident and normalise_tag(WRONG_TAG) not in resident
 		try:
-			await asyncio.to_thread(assert_resident, card.endpoint, WRONG_TAG)
+			# exact=False so only the absent-tag clause can fire.
+			await asyncio.to_thread(assert_resident, card.endpoint, WRONG_TAG, exact=False)
 		except NotResident as err:
-			record('4. the /api/ps assertion catches a deliberately wrong model name', True,
-			       f'assert_resident({WRONG_TAG!r}) raised NotResident: {str(err)[:150]}')
+			record('4. the /api/ps assertion catches a deliberately wrong model name',
+			       premise and 'not qwen2.5-coder:14b' in str(err),
+			       f'resident={sorted(resident)}; assert_resident({WRONG_TAG!r}, exact=False) '
+			       f'raised NotResident: {str(err)[:130]}')
 		else:
 			record('4. the /api/ps assertion catches a deliberately wrong model name', False,
 			       f'assert_resident({WRONG_TAG!r}) passed while {WORKLOAD} was leased')
@@ -278,18 +315,22 @@ async def gate_hold_and_free(warden: AsyncWardenClient, baseline: dict, hold_s: 
 			await asyncio.sleep(SAMPLE_S)
 
 	held_s = time.monotonic() - granted
+	# The name carries the duration, because the pass predicate scales with --hold-s and a
+	# 30-second run must not print "held 10 continuous minutes".
+	name = (f'1. a lease held {hold_s / 60:.0f} continuous minutes, visible in /v1/status '
+	        f'throughout')
 	if not samples:
-		record('1. a lease held 10 continuous minutes, visible in /v1/status throughout',
-		       False, f'held {held_s:.0f}s but took no samples — --hold-s below one interval?')
-		samples = [{'mine': False, 'state': None, 'tenant': False, 'free': None,
-		            'committed': None, 'ghost': 0}]
-	bad = [s for s in samples if not (s['mine'] and s['state'] == 'active' and s['tenant'])]
-	record('1. a lease held 10 continuous minutes, visible in /v1/status throughout',
-	       not bad and held_s >= hold_s and len(samples) >= hold_s / SAMPLE_S - 1,
-	       f'{held_s:.0f}s held, {len(samples)} samples, {len(bad)} of them not showing an '
-	       f'active lease + tenant; committed {samples[0]["committed"]}→'
-	       f'{samples[-1]["committed"]} MiB, ghost stayed '
-	       f'{max(s["ghost"] or 0 for s in samples)}')
+		record(name, False, f'held {held_s:.0f}s but took no samples — --hold-s below one '
+		                    f'sample interval ({SAMPLE_S:.0f}s)?')
+	else:
+		bad = [s for s in samples
+		       if not (s['mine'] and s['state'] == 'active' and s['tenant'])]
+		record(name,
+		       not bad and held_s >= hold_s and len(samples) >= hold_s / SAMPLE_S - 1,
+		       f'{held_s:.0f}s held, {len(samples)} samples, {len(bad)} of them not showing '
+		       f'an active lease + tenant; committed {samples[0]["committed"]}→'
+		       f'{samples[-1]["committed"]} MiB, ghost stayed '
+		       f'{max(s["ghost"] or 0 for s in samples)}')
 
 	await gate_freed(warden, since_id=max_event_id, baseline=baseline)
 
@@ -341,6 +382,11 @@ async def gate_freed(warden: AsyncWardenClient, *, since_id: int, baseline: dict
 	freed, expected = fields.get('freed_mib'), fields.get('expected_mib')
 	fraction = (freed / expected) if (freed and expected) else None
 
+	# warden's own choice of evict_verified over evict_unverified IS the verify_freed_fraction
+	# assertion — it made that comparison against the live policy value and the MEASURED
+	# expected figure. Re-deriving it here against a hard-coded 0.8 would only add a way for
+	# the gate to disagree with warden after a policy tuning. The fraction is reported, not
+	# graded.
 	ok = (
 		verified is not None
 		and 'evict_unverified' not in seen
@@ -349,12 +395,12 @@ async def gate_freed(warden: AsyncWardenClient, *, since_id: int, baseline: dict
 		and not v.get('committed_mib')
 		and WORKLOAD not in tenants
 		and not resident
-		and fraction is not None and fraction >= VERIFY_FREED_FRACTION
 	)
 	detail = (f'saw {sorted(seen)}; '
-	          + (f'evict_verified freed {freed} of an expected {expected} MiB '
-	             f'({fraction:.2f} >= verify_freed_fraction {VERIFY_FREED_FRACTION})'
-	             if fraction is not None else 'no evict_verified with a freed_mib field')
+	          + (f'evict_verified freed {freed} of an expected {expected} MiB'
+	             + (f' ({fraction:.2f}, policy floor {VERIFY_FREED_FRACTION})'
+	                if fraction is not None else '')
+	             if verified is not None else 'no evict_verified')
 	          + f'; after teardown: committed={v.get("committed_mib")} ghost={v.get("ghost_mib")} '
 	            f'free={v.get("free_mib")} tenants={tenants} /api/ps={resident}')
 	record('2. release frees within verify_freed_fraction and books no ghost', ok, detail)
@@ -370,6 +416,15 @@ async def main() -> int:
 	                help='for --only freed: ignore events at or below this id')
 	args = ap.parse_args()
 	only = {s.strip() for s in args.only.split(',') if s.strip()}
+
+	known = {'lost', 'sigint', 'sigterm', 'assert', 'hold', 'freed'}
+	unknown = only - known
+	if unknown:
+		raise SystemExit(f'unknown gate(s): {sorted(unknown)}; pick from {sorted(known)}')
+	if 'freed' in only and not args.since_event_id:
+		raise SystemExit('--only freed needs --since-event-id: without it the scan starts at '
+		                 '0 and matches an evict_verified from an older run. Get the id from '
+		                 'GET /v1/events immediately before the release you mean to watch.')
 
 	logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
 	if not os.environ.get('WARDEN_URL') and not os.environ.get('WARDEN_HOST'):
@@ -407,8 +462,9 @@ async def main() -> int:
 		('freed', lambda: gate_freed(warden, since_id=args.since_event_id, baseline=baseline)),
 	]
 	default_steps = {'lost', 'sigint', 'sigterm', 'assert', 'hold'}
+	selected = only or default_steps
 	for name, step in steps:
-		if name not in (only or default_steps):
+		if name not in selected:
 			continue
 		print(f'\n{"=" * 78}\n== {name}\n{"=" * 78}', flush=True)
 		try:

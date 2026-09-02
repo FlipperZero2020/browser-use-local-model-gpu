@@ -102,6 +102,11 @@ REPEAT_CANCEL_MAX = 3
 #: somebody upstream is holding the card and acquiring a second lease would double-book it.
 ENDPOINT_ENV = 'WARDEN_ENDPOINT'
 
+#: Total wall-clock budget for both `/api/ps` assertions together. Two local GETs against a
+#: LAN box; if they have not finished in this long, something is wrong with the endpoint and
+#: the lease should fail rather than hang before the caller ever sees the card.
+ASSERTION_BUDGET_S = 45.0
+
 
 class Interrupted(KeyboardInterrupt):
 	"""SIGINT or SIGTERM arrived while the card was held, and the lease was released.
@@ -146,6 +151,16 @@ def _get_json(url: str, timeout_s: float) -> Any:
 	return json.loads(raw) if raw else {}
 
 
+def is_ollama(workload: str) -> bool:
+	"""Only `ollama:*` workloads have an `/api/ps` to assert against.
+
+	`hold()` is generic — it leases `clonin` and `acestep` just as happily — and probing
+	those endpoints for `/api/ps` would fail for reasons that have nothing to do with the
+	lease. Obligations 3 and 4 are Ollama-shaped, so they are skipped, out loud, elsewhere.
+	"""
+	return workload.startswith('ollama:')
+
+
 def normalise_tag(tag: str) -> str:
 	"""`qwen3` and `qwen3:latest` are the same model; `ollama:qwen3:8b` names a workload.
 
@@ -158,6 +173,15 @@ def normalise_tag(tag: str) -> str:
 	return tag if ':' in tag else tag + ':latest'
 
 
+#: warden's ollama driver resolves the model as `spec.config.get('model')` first and only
+#: falls back to stripping the `ollama:` prefix off the workload id — its own docstring says
+#: `config.model` exists "for a workload whose id should not be its model name". Neither
+#: declared ollama workload sets it today, so deriving the tag from the id is correct on
+#: this box; `hold(model_tag=...)` is the escape hatch for when that stops being true, and
+#: policy is not readable from the client to find out.
+MODEL_TAG_NOTE = 'derived from the workload id; pass model_tag= if policy sets config.model'
+
+
 def resident_models(endpoint: str, *, timeout_s: float = 15.0) -> list[dict]:
 	"""`GET /api/ps` — what Ollama has loaded *right now*, as raw dicts.
 
@@ -166,22 +190,39 @@ def resident_models(endpoint: str, *, timeout_s: float = 15.0) -> list[dict]:
 	context length — is the one most likely to be newer than the client.
 	"""
 	body = _get_json(endpoint.rstrip('/') + '/api/ps', timeout_s)
-	return list(body.get('models') or [])
+	if not isinstance(body, dict):
+		raise NotResident(
+			f'{endpoint}/api/ps answered with {type(body).__name__}, not a JSON object. '
+			f'Is that endpoint really Ollama? A reverse proxy or a captive portal will '
+			f'happily return 200 and valid JSON of the wrong shape.'
+		)
+	return [m for m in (body.get('models') or []) if isinstance(m, dict)]
 
 
 def _context_length(entry: dict) -> int | None:
-	"""The served window, from wherever this Ollama version puts it."""
-	for key in ('context_length', 'num_ctx', 'context'):
+	"""The window this runner was *loaded* at. Measured on 0.32.15: top-level
+	`context_length`, 4096 for `qwen3:8b` — whose architectural maximum is 40960.
+
+	Only these two keys, deliberately. `details` carries the model's own metadata
+	(`parameter_size`, `quantization_level`, and on some builds the architecture's maximum
+	context), which is a different number from the one the runner is serving. Reading it
+	as a fallback would turn "I could not check" into a confident wrong answer, which is
+	the exact failure `ContextWindowUnknown` exists to keep separate.
+	"""
+	for key in ('context_length', 'num_ctx'):
 		value = entry.get(key)
 		if isinstance(value, int) and value > 0:
 			return value
-	details = entry.get('details')
-	if isinstance(details, dict):
-		for key in ('context_length', 'num_ctx'):
-			value = details.get(key)
-			if isinstance(value, int) and value > 0:
-				return value
 	return None
+
+
+def _on_card(entry: dict) -> tuple[int, int]:
+	"""`(vram_bytes, total_bytes)` for a resident model. This is how `ollama ps` computes
+	its 100% GPU / 47%/53% CPU/GPU column."""
+	vram = entry.get('size_vram')
+	total = entry.get('size')
+	return (int(vram) if isinstance(vram, int) else 0,
+	        int(total) if isinstance(total, int) else 0)
 
 
 def assert_resident(endpoint: str, workload_or_tag: str, *, exact: bool = True,
@@ -213,10 +254,27 @@ def assert_resident(endpoint: str, workload_or_tag: str, *, exact: bool = True,
 		other = sorted(set(seen) - {want})
 		raise NotResident(
 			f'{endpoint}/api/ps shows {other} resident alongside the leased {want}. '
-			f'Either another tenant holds VRAM this run did not budget for, or a load '
-			f'leaked outside warden\'s book. Check /v1/status before continuing.'
+			f'Either another tenant holds VRAM this run did not budget for, or something '
+			f'called :11434 without a lease and loaded weights outside warden\'s book — '
+			f'an unleased call succeeds, it does not fail. Check /v1/status, and pass '
+			f'exact_residency=False only once you know which.'
 		)
-	return seen[want]
+
+	entry = seen[want]
+	vram, total = _on_card(entry)
+	# "Resident" is not the same as "on the GPU". Ollama silently splits a model across
+	# CPU and GPU when it does not fit, and reports both numbers; `ollama ps` divides them
+	# for its GPU% column. warden booked cost_mib of VRAM for this lease, so a model that
+	# landed on the CPU means the book is wrong AND inference is an order of magnitude
+	# slower — with nothing in the response saying so.
+	if total > 0 and vram < total * 0.99:
+		raise NotResident(
+			f'{want} is loaded but only {vram / 1048576:.0f} MiB of {total / 1048576:.0f} '
+			f'MiB is on the card ({100 * vram / total:.0f}%) — Ollama split it with the CPU. '
+			f'warden booked this lease as VRAM, so its book is now wrong, and generation '
+			f'will be far slower than the measurement this workload was declared from.'
+		)
+	return entry
 
 
 def assert_context_window(endpoint: str, workload_or_tag: str, expected_num_ctx: int, *,
@@ -404,12 +462,30 @@ def _signal_cancellation(loop: asyncio.AbstractEventLoop, task: asyncio.Task,
 
 
 # ── the handshake ────────────────────────────────────────────────────────────
+async def _run_assertions(card: Card, tag: str, num_ctx: int | None, exact: bool) -> None:
+	"""Obligations 3 and 4, off the loop and on a total deadline.
+
+	`urlopen(timeout=…)` bounds each socket operation, not the call: a server that trickles
+	bytes forever never trips it. `wait_for` bounds the whole thing, which matters because
+	this runs *before* the caller is handed the card and therefore before anything they
+	wrote could cancel it.
+	"""
+	async def probe() -> None:
+		await asyncio.to_thread(assert_resident, card.endpoint, tag, exact=exact)
+		if num_ctx is not None:
+			card.num_ctx = await asyncio.to_thread(
+				assert_context_window, card.endpoint, tag, num_ctx)
+
+	await asyncio.wait_for(probe(), timeout=ASSERTION_BUDGET_S)
+
+
 @contextlib.asynccontextmanager
 async def hold(
 	workload: str,
 	*,
 	reason: str | None = None,
 	num_ctx: int | None = None,
+	model_tag: str | None = None,
 	ttl_s: float = DEFAULT_TTL_S,
 	priority: str | None = DEFAULT_PRIORITY,
 	timeout_s: float = DEFAULT_ACQUIRE_TIMEOUT_S,
@@ -427,21 +503,21 @@ async def hold(
 	way out: normally, on an exception, on Ctrl-C, and on SIGTERM.
 
 	`num_ctx=None` skips obligation 4 rather than guessing — pass the window this run will
-	configure and it becomes an assertion.
+	configure and it becomes an assertion. Obligations 3 and 4 are Ollama-shaped and are
+	skipped, with a log line, for any other driver.
 	"""
+	tag = model_tag or normalise_tag(workload)
+	assertable = verify and is_ollama(workload)
+	if verify and not assertable:
+		log.info('%s is not an ollama workload; skipping the /api/ps assertions', workload)
 	inherited = os.environ.get(ENDPOINT_ENV)
 	if inherited:
 		# Somebody upstream — a future `warden hold` — already has the card. Taking a
 		# second lease would double-book it against ourselves.
 		log.info('%s is set; using the inherited endpoint and not acquiring a lease', ENDPOINT_ENV)
-		card = Card(workload=workload, model_tag=normalise_tag(workload),
-		            endpoint=inherited, leased=False)
-		if verify:
-			await asyncio.to_thread(assert_resident, card.endpoint, workload,
-			                        exact=exact_residency)
-			if num_ctx is not None:
-				card.num_ctx = await asyncio.to_thread(
-					assert_context_window, card.endpoint, workload, num_ctx)
+		card = Card(workload=workload, model_tag=tag, endpoint=inherited, leased=False)
+		if assertable:
+			await _run_assertions(card, tag, num_ctx, exact_residency)
 		yield card
 		return
 
@@ -487,8 +563,8 @@ async def hold(
 				raise_if_lost=False,
 			) as held:
 				seen['lease_id'] = held.lease_id
-				card = Card(workload=workload, model_tag=normalise_tag(workload),
-				            endpoint=held.endpoint, leased=True, held=held, lease=held.lease)
+				card = Card(workload=workload, model_tag=tag, endpoint=held.endpoint,
+				            leased=True, held=held, lease=held.lease)
 
 				def on_lost() -> None:
 					if not seen['lost']:
@@ -500,14 +576,8 @@ async def hold(
 					task.cancel()
 
 				try:
-					if verify:
-						# Off the loop: two blocking GETs, and the heartbeat thread keeps
-						# beating through them either way.
-						await asyncio.to_thread(assert_resident, card.endpoint, workload,
-						                        exact=exact_residency)
-						if num_ctx is not None:
-							card.num_ctx = await asyncio.to_thread(
-								assert_context_window, card.endpoint, workload, num_ctx)
+					if assertable:
+						await _run_assertions(card, tag, num_ctx, exact_residency)
 
 					watcher = _LostWatcher(held.lost_event, loop, on_lost)
 					watcher.start()

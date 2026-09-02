@@ -25,7 +25,18 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from warden.client import Lease, LeaseLost  # noqa: E402
 
-from browsin.lease import Interrupted, _LostWatcher, hold  # noqa: E402
+from browsin.lease import (  # noqa: E402
+	ContextWindowMismatch,
+	ContextWindowUnknown,
+	Interrupted,
+	NotResident,
+	_LostWatcher,
+	assert_context_window,
+	assert_resident,
+	hold,
+	is_ollama,
+	normalise_tag,
+)
 
 FAKE_ENDPOINT = 'http://127.0.0.1:1'
 failures: list[str] = []
@@ -178,6 +189,112 @@ async def case_external_cancel() -> None:
 		      [k for k, _ in w.journal].count('released') == 1, str(w.journal))
 
 
+# ── the /api/ps assertions, against a stub that answers whatever we like ─────
+import http.server  # noqa: E402
+import json as _json  # noqa: E402
+import threading as _threading  # noqa: E402
+
+
+class _PsStub:
+	"""A one-route HTTP server standing in for Ollama, so the assertions can be shown
+	the payloads a real box only produces when something has already gone wrong."""
+
+	def __init__(self, payload: object) -> None:
+		self.payload = payload
+		outer = self
+
+		class Handler(http.server.BaseHTTPRequestHandler):
+			def do_GET(self) -> None:  # noqa: N802
+				body = _json.dumps(outer.payload).encode()
+				self.send_response(200)
+				self.send_header('Content-Type', 'application/json')
+				self.send_header('Content-Length', str(len(body)))
+				self.end_headers()
+				self.wfile.write(body)
+
+			def log_message(self, *_a: object) -> None:
+				pass
+
+		self.server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+		self.url = f'http://127.0.0.1:{self.server.server_port}'
+
+	def __enter__(self) -> '_PsStub':
+		_threading.Thread(target=self.server.serve_forever, daemon=True).start()
+		return self
+
+	def __exit__(self, *_exc: object) -> None:
+		self.server.shutdown()
+		self.server.server_close()
+
+
+def _entry(**over: object) -> dict:
+	entry = {'name': 'qwen3:8b', 'model': 'qwen3:8b', 'size': 5578204118,
+	         'size_vram': 5578204118, 'context_length': 4096}
+	entry.update(over)
+	return entry
+
+
+def case_assertions() -> None:
+	# The one that matters: loaded, right name, and mostly on the CPU.
+	with _PsStub({'models': [_entry(size_vram=2600000000)]}) as stub:
+		try:
+			assert_resident(stub.url, 'ollama:qwen3:8b')
+		except NotResident as err:
+			check('a model Ollama split onto the CPU is not "resident"',
+			      'split it with the CPU' in str(err), str(err)[:110])
+		else:
+			check('a model Ollama split onto the CPU is not "resident"', False,
+			      'passed a model that is 47% on the card')
+
+	with _PsStub({'models': [_entry()]}) as stub:
+		try:
+			assert_resident(stub.url, 'ollama:qwen3:8b')
+			ok = True
+		except NotResident as err:
+			ok, detail = False, str(err)[:110]
+		check('a fully-resident model passes', ok, '' if ok else detail)
+
+	# A 200 of the wrong shape, which a proxy or captive portal will happily return.
+	for payload, label in ((None, 'null'), ([], 'a list')):
+		with _PsStub(payload) as stub:
+			try:
+				assert_resident(stub.url, 'ollama:qwen3:8b')
+			except NotResident as err:
+				check(f'/api/ps answering {label} is a clear error, not an AttributeError',
+				      'not a JSON object' in str(err), str(err)[:90])
+			except Exception as err:  # noqa: BLE001
+				check(f'/api/ps answering {label} is a clear error, not an AttributeError',
+				      False, f'{type(err).__name__}: {err}')
+
+	# "I could not check" must stay distinct from "I checked and it was wrong".
+	with _PsStub({'models': [_entry(context_length=None,
+	                                details={'parameter_size': '8.2B', 'context_length': 40960})]}) as stub:
+		try:
+			assert_context_window(stub.url, 'ollama:qwen3:8b', 4096)
+		except ContextWindowUnknown:
+			check('a missing context length is UNKNOWN, not read from details', True,
+			      'details.context_length (40960, the architectural max) was not used')
+		except ContextWindowMismatch as err:
+			check('a missing context length is UNKNOWN, not read from details', False,
+			      f'read the wrong field: {str(err)[:80]}')
+
+	with _PsStub({'models': [_entry()]}) as stub:
+		try:
+			assert_context_window(stub.url, 'ollama:qwen3:8b', 32768)
+		except ContextWindowMismatch as err:
+			check('a wrong num_ctx is caught', 'served at num_ctx=4096' in str(err), str(err)[:90])
+		else:
+			check('a wrong num_ctx is caught', False, 'no exception')
+
+	check('normalise_tag handles every declared workload id',
+	      [normalise_tag(w) for w in ('ollama:qwen3:8b', 'ollama:qwen2.5-coder:14b')]
+	      == ['qwen3:8b', 'qwen2.5-coder:14b'],
+	      str([normalise_tag(w) for w in ('ollama:qwen3:8b', 'ollama:qwen2.5-coder:14b')]))
+	check('non-ollama workloads are not probed for /api/ps',
+	      not any(is_ollama(w) for w in ('clonin', 'acestep', 'exclusive:hashcat'))
+	      and is_ollama('ollama:qwen3:8b'), '')
+
+
 # ── subprocess cases: real signals ───────────────────────────────────────────
 CHILD = r'''
 import asyncio, os, signal, sys, time, pathlib
@@ -239,6 +356,9 @@ async def main() -> int:
 	for case in (case_normal, case_body_raises, case_verify_fails, case_lost,
 	             case_swallows_cancel, case_external_cancel):
 		await case()
+
+	print('\nthe /api/ps assertions, against a stub:')
+	case_assertions()
 
 	print('\nreal signals, in a child process:')
 	run_child('SIGTERM mid-hold releases and reports which signal',
