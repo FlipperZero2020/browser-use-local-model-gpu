@@ -87,8 +87,16 @@ LOST_POLL_S = 0.25
 #: blocking HTTP POST does not see the cancellation until that POST returns, and a step
 #: that catches `CancelledError` broadly would swallow it outright. So the watcher keeps
 #: asking rather than asking once.
-REPEAT_CANCEL_S = 1.0
-REPEAT_CANCEL_MAX = 10
+#:
+#: The cadence is a real trade-off and the first version got it wrong. Re-firing every
+#: second cuts up the body's *own* async cleanup — a `finally` that awaits anything gets
+#: cancelled again part-way through closing the browser. Five seconds, three times, gives
+#: an unwinding body room while still defeating a swallow, and the whole window is 15 s
+#: against a 30 s heartbeat. A body that needs longer than that after a revocation is
+#: being cut short deliberately: the lease is already gone, the model is already unloaded,
+#: and warden may be loading somebody else's weights into that memory.
+REPEAT_CANCEL_S = 5.0
+REPEAT_CANCEL_MAX = 3
 
 #: Set by `warden hold` (PLAN.md §7, Phase 7). If it is already in the environment,
 #: somebody upstream is holding the card and acquiring a second lease would double-book it.
@@ -504,6 +512,20 @@ async def hold(
 					watcher = _LostWatcher(held.lost_event, loop, on_lost)
 					watcher.start()
 					yield card
+
+					# The body returned normally — but it may have done so by swallowing
+					# every cancellation the watcher sent, in which case everything after
+					# the revocation ran against a model warden had already unloaded. A
+					# silent success is the worst available outcome, so say it out loud.
+					# (warden's own `raise_if_lost` is off because we raise from the
+					# cancellation path instead; this is the other half of it.)
+					if held.lost or seen['lost']:
+						raise LeaseLost(
+							f'lease {held.lease_id} for {workload} was lost while it was '
+							f'held, and the run finished anyway — it swallowed the '
+							f'cancellation, so its last steps ran against an unloaded model',
+							state='revoked', lease_id=held.lease_id,
+						)
 				finally:
 					if watcher is not None:
 						watcher.stop()

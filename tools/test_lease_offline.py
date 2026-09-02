@@ -60,6 +60,10 @@ class _FakeHeld:
 		self.lease = lease
 		self.lost_event = lost
 
+	@property
+	def lost(self) -> bool:
+		return self.lost_event.is_set()
+
 	def check(self) -> None:
 		if self.lost_event.is_set():
 			raise LeaseLost('gone', state='gone', lease_id=self.lease_id)
@@ -130,6 +134,30 @@ async def case_lost() -> None:
 		      f'{time.monotonic() - t0:.2f}s, {w.journal}')
 		return
 	check('a lost lease cancels the body and raises LeaseLost', False, 'no LeaseLost')
+
+
+async def case_swallows_cancel() -> None:
+	"""A body that catches CancelledError broadly must not produce a silent success."""
+	w = FakeWarden()
+	swallowed = {'n': 0}
+	t0 = time.monotonic()
+	try:
+		async with hold('ollama:qwen3:8b', client=w, verify=False, handle_signals=False):
+			threading.Timer(0.2, w.lost.set).start()
+			for _ in range(4):
+				try:
+					await asyncio.sleep(3)
+				except asyncio.CancelledError:
+					swallowed['n'] += 1
+					asyncio.current_task().uncancel()
+	except LeaseLost as err:
+		check('a body that swallows every cancel still fails loudly',
+		      'swallowed the cancellation' in str(err) or swallowed['n'] > 0,
+		      f'swallowed {swallowed["n"]} cancel(s) over {time.monotonic() - t0:.1f}s, '
+		      f'then LeaseLost: {str(err)[:80]}')
+		return
+	check('a body that swallows every cancel still fails loudly', False,
+	      f'exited cleanly after swallowing {swallowed["n"]} cancel(s)')
 
 
 async def case_external_cancel() -> None:
@@ -209,7 +237,7 @@ def run_child(name: str, *, delay: float, body: str, signals: int, wait_for_hold
 async def main() -> int:
 	print('\nin-process (fake warden):')
 	for case in (case_normal, case_body_raises, case_verify_fails, case_lost,
-	             case_external_cancel):
+	             case_swallows_cancel, case_external_cancel):
 		await case()
 
 	print('\nreal signals, in a child process:')
