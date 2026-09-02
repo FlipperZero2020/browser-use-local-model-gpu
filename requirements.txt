@@ -1,0 +1,16 @@
+# browsin — pinned deliberately. An unpinned `pip install browser-use` is the root
+# cause of the divergence this project's PLAN.md §10 exists to record: the venv moved
+# 0.9.7 → 0.13.8 under a plan written for 0.9.7, and because `Agent.__init__` ends in
+# a `**kwargs` it never reads, the old code kept constructing cleanly and silently
+# doing half of nothing. Do not relax these to `>=`.
+
+browser-use==0.13.8
+# ↑ hard-pins its own load-bearing deps, so they are not repeated here:
+#     ollama==0.6.1     the client ChatOllama talks through
+#     cdp-use==1.4.5    the CDP transport that replaced Playwright in 0.13.x
+
+# warden's client is stdlib-only (`dependencies = []`, requires-python >=3.11) and is
+# the API's own contract — server and client ship from one repo so neither can drift.
+# The tag is immutable: v0.3.0^{} == a252644aa5bdb17b611d9448e413ababe6fbaec7,
+# verified against the remote 2026-09-01 and matching what this venv has installed.
+warden @ git+https://github.com/FlipperZero2020/warden.git@v0.3.0
