@@ -727,6 +727,14 @@ Ordered by how expensive the surprise is.
   channel of any kind. `WardenClient(heartbeat_interval_s=5)` looks like the fix and does
   nothing: the client uses `lease.heartbeat_interval_s or default`, and warden always
   sends 30. The **only** lever is a shorter `ttl_s`, through `min(interval, ttl_s/3)`.
+- **`lost_event` is not the fastest revocation signal available, only the only *push-ish*
+  one.** Polling `GET /v1/leases/{id}` observes a revocation at *your* cadence rather than
+  the heartbeat's, because the lease view goes terminal immediately. `lease.py` does not do
+  this today — the gate's bar is "within one heartbeat" and it clears that — but Phase 4 is
+  where it starts to matter, because a browser step can run for minutes against a model
+  that is already gone. Note the cost: every `/v1/status` and `/v1/leases` call pumps
+  warden's engine under its lock and can run `nvidia-smi` (cached 0.2 s), so a 5 s cadence
+  is fine and a 1 s one from several processes is not.
 - **`lost_event` never fires when warden is merely unreachable.** The heartbeat swallows
   `WardenUnreachable` as transient by design, and one such beat can occupy the heartbeat
   thread for ~240 s (four attempts at a 60 s timeout, plus backoff). Losing warden and
@@ -741,9 +749,18 @@ Ordered by how expensive the surprise is.
   *untouched* `CancelledError` back into the `KeyboardInterrupt` it came from, so
   rewriting a cancellation you did not cause destroys the caller's signal. Convert only
   the ones you raised, and `uncancel()` only those.
-- **`Agent(enable_signal_handler=...)` defaults to `True`** and installs browser-use's own
-  SIGINT handler, which fights the lease holder's. Anything holding a lease must pass it
-  `False`.
+- **`Agent(enable_signal_handler=...)` defaults to `True`, and its second Ctrl-C is
+  `os._exit(0)`** (`browser_use/utils.py:290`). `os._exit` runs no `atexit` at all, so
+  browser-use's handler does not merely fight the lease holder's — it defeats warden's own
+  last-resort release. `enable_signal_handler=False` is not a preference for a lease
+  holder, it is required.
+- **A cancellation the body swallows is worse than one it never gets.** Agent loops catch
+  `CancelledError` broadly. A body that outlasts every cancel and then returns *normally*
+  produced a clean exit from `hold()` while everything after the revocation ran against an
+  unloaded model. `lease.py` now checks `held.lost` after a normal body exit too. The
+  repeat-cancel cadence is the same trade-off from the other side: re-firing every second
+  chopped up the body's own async cleanup, so it is 5 s × 3 — 15 s of room against a 30 s
+  heartbeat, and a body needing longer is cut short on purpose.
 - **An empty-string env var is not "unset" to browser-use, and is not harmless.** The
   parser is `os.getenv(name, default).lower()[:1] in 'ty1'`, and `'' in 'ty1'` is `True` in
   Python — so a blank `ANONYMIZED_TELEMETRY` reads as **enabled**. Worse, `FlatEnvConfig`

@@ -375,6 +375,19 @@ async def main() -> int:
 	if not os.environ.get('WARDEN_URL') and not os.environ.get('WARDEN_HOST'):
 		raise SystemExit('set WARDEN_URL (and WARDEN_TOKEN_FILE) first')
 
+	# Every hold below passes handle_signals=False, deliberately: the gate must measure
+	# lease.py's signal behaviour in a CHILD process, not have it fire in the harness
+	# half-way through a measurement. The cost is that this process would then take a
+	# default-disposition SIGTERM — no finally, no atexit — and strand the card, which is
+	# exactly what happened once while stopping a contaminated run. Turning the signal into
+	# a SystemExit is enough: warden's lease() registers an atexit _last_resort at acquire,
+	# and SystemExit runs it.
+	def _exit_on_signal(signum: int, _frame: object) -> None:
+		raise SystemExit(128 + signum)
+
+	for _sig in (signal.SIGTERM, signal.SIGHUP):
+		signal.signal(_sig, _exit_on_signal)
+
 	warden = AsyncWardenClient.from_env()
 	sync = WardenClient.from_env()
 	baseline = await preflight(warden)
@@ -386,12 +399,16 @@ async def main() -> int:
 		('sigterm', lambda: asyncio.to_thread(gate_signal, sync, signal.SIGTERM)),
 		('assert', lambda: gate_assertions(warden)),
 		('hold', lambda: gate_hold_and_free(warden, baseline, args.hold_s)),
-		# Standalone: watch a teardown that is already in flight, e.g. after a lease this
-		# gate did not take. `--since-event-id` scopes the scan.
+		# NOT in the default sequence: `hold` already runs gate_freed with the right
+		# since_id. This entry exists only for `--only freed`, to watch a teardown that is
+		# already in flight after a lease this gate did not take. Run by default it scans
+		# from id 0 and re-matches an evict_verified from an older run — which it did,
+		# picking up a degenerate `0 MiB of an expected 0 MiB` and failing on it.
 		('freed', lambda: gate_freed(warden, since_id=args.since_event_id, baseline=baseline)),
 	]
+	default_steps = {'lost', 'sigint', 'sigterm', 'assert', 'hold'}
 	for name, step in steps:
-		if only and name not in only:
+		if name not in (only or default_steps):
 			continue
 		print(f'\n{"=" * 78}\n== {name}\n{"=" * 78}', flush=True)
 		try:
