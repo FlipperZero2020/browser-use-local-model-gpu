@@ -107,6 +107,11 @@ ENDPOINT_ENV = 'WARDEN_ENDPOINT'
 #: the lease should fail rather than hang before the caller ever sees the card.
 ASSERTION_BUDGET_S = 45.0
 
+#: One attempt, this long, for the synchronous last-resort release. Short on purpose: it
+#: can run inside a signal handler after the default disposition has been restored, and a
+#: handler that blocks for minutes is worse than a lease the TTL collects.
+LAST_RESORT_TIMEOUT_S = 5.0
+
 
 class Interrupted(KeyboardInterrupt):
 	"""SIGINT or SIGTERM arrived while the card was held, and the lease was released.
@@ -454,11 +459,14 @@ def _signal_cancellation(loop: asyncio.AbstractEventLoop, task: asyncio.Task,
 	try:
 		yield
 	finally:
+		# Order matters: `remove_signal_handler` unconditionally sets SIG_DFL (or
+		# default_int_handler for SIGINT), so restoring the previous disposition first
+		# would simply be overwritten and the caller would come back to a bare SIGTERM.
 		for signum, previous in installed:
-			with contextlib.suppress(RuntimeError, ValueError, TypeError):
-				signal.signal(signum, previous)
 			with contextlib.suppress(RuntimeError, ValueError):
 				loop.remove_signal_handler(signum)
+			with contextlib.suppress(RuntimeError, ValueError, TypeError):
+				signal.signal(signum, previous)
 
 
 # ── the handshake ────────────────────────────────────────────────────────────
@@ -536,12 +544,25 @@ async def hold(
 	watcher: _LostWatcher | None = None
 
 	def release_sync() -> None:
-		"""Blocking DELETE, safe from a signal handler. Idempotent; a 404 is not an error."""
+		"""Blocking DELETE, safe from a signal handler. Idempotent; a 404 is not an error.
+
+		On its own short-lived client: the caller's has `timeout_s=60` and `retries=3`, so
+		four attempts plus jittered backoff — up to ~four minutes inside a signal handler
+		that has already restored `SIG_DFL`, in exactly the situation (warden unreachable)
+		that produces it. One attempt, five seconds, then give up and let the TTL collect it.
+		"""
 		lease_id = seen.get('lease_id')
 		if not lease_id:
 			return
+		try:
+			releaser = WardenClient(
+				warden.sync.base_url, warden.sync.token, timeout_s=LAST_RESORT_TIMEOUT_S,
+				retries=0, auth_header=warden.sync.auth_header,
+			).release
+		except Exception:  # noqa: BLE001 — an injected client need not look like the real one
+			releaser = warden.sync.release
 		with contextlib.suppress(Exception):
-			warden.sync.release(lease_id)
+			releaser(lease_id)
 
 	def remember(view: Lease) -> None:
 		# The acquire snapshot is the earliest moment a lease id exists, and the last
@@ -590,6 +611,10 @@ async def hold(
 					# (warden's own `raise_if_lost` is off because we raise from the
 					# cancellation path instead; this is the other half of it.)
 					if held.lost or seen['lost']:
+						# The body swallowed the watcher's cancels, so they are still on
+						# the task's counter and the release below would be interrupted.
+						while task.cancelling():
+							task.uncancel()
 						raise LeaseLost(
 							f'lease {held.lease_id} for {workload} was lost while it was '
 							f'held, and the run finished anyway — it swallowed the '
@@ -610,8 +635,20 @@ async def hold(
 			# propagate: rewriting it would destroy their signal, and `asyncio.run` turns
 			# an untouched CancelledError back into the KeyboardInterrupt it came from.
 			raise
-		# Ours. Clear it so anything still unwinding can await, then say what happened.
-		task.uncancel()
+		# Ours. Clear the cancellations so anything still unwinding can await — every one
+		# the watcher delivered, not just the last: `cancel()` increments a counter that
+		# `uncancel()` decrements one at a time, and a residual count breaks the next
+		# `asyncio.timeout` the caller enters.
+		while task.cancelling():
+			task.uncancel()
+		# And give the card back by hand. `AsyncWardenClient.lease` drives a *sync*
+		# context manager through `asyncio.to_thread(cm.__enter__)`; cancelling that await
+		# only detaches the coroutine. The worker thread finishes the acquire, starts the
+		# heartbeat and parks at the yield, and `cm.__exit__` is never called — so a
+		# cancellation during a ~190 s cold load leaves a live, heartbeating lease that
+		# only warden's `atexit` collects, and only if the process actually exits. This
+		# DELETE is idempotent and a 404 is not an error.
+		release_sync()
 		if seen['lost']:
 			raise LeaseLost(
 				f'lease {seen["lease_id"]} for {workload} was revoked while it was held; '
@@ -619,7 +656,7 @@ async def hold(
 				state='revoked', lease_id=seen['lease_id'],
 			) from None
 		raise Interrupted(
-			f'{seen["signal"]} during {workload}; the lease was released',
+			f'{seen["signal"]} during {workload}; the lease has been given back',
 			signal=seen['signal'],
 		) from None
 
