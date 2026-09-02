@@ -568,7 +568,63 @@ phase actually established is narrower than "test it": *a gate that cannot fail 
 passed*, and the way to find out which kind you have is to make it grade a run you
 deliberately broke.
 
-@@GATE_OUTPUT@@
+**Gate output, `tools/phase2_gate.py`, 2026-09-01 22:22–22:37, from an idle card
+(`free 13879 · foreign 2501 · ghost 0 · committed 0 · no tenants, no leases`):**
+
+```
+== lost
+  lease 5ba574cd: pending (starting) -> active after 15.3s; heartbeat every 30s
+  releasing 5ba574cd out from under the holder...
+  lease 5ba574cd lost - cancelling the run
+  [PASS] 5. lost_event fires and cancels within one heartbeat
+         cancelled 9.7s after the lease was released out from under it (interval 30s)
+
+== sigint / sigterm                       (a child process, so the gate survives to report)
+  [PASS] 3. SIGINT  mid-hold releases cleanly   child exited 0 'RELEASED_ON_SIGNAL SIGINT';
+                                                warden reports the lease as released
+  [PASS] 3. SIGTERM mid-hold releases cleanly   child exited 0 'RELEASED_ON_SIGNAL SIGTERM';
+                                                warden reports the lease as released
+
+== assert
+  resident: [{"model": "qwen3:8b", "size_vram_mib": 5320, "context_length": 4096}]
+  [PASS] 4.  the /api/ps assertion catches a deliberately wrong model name
+         resident=['qwen3:8b']; assert_resident('ollama:qwen2.5-coder:14b') raised NotResident
+  [PASS] 4b. the num_ctx assertion catches a wrong window
+         served at num_ctx=4096, configured 32768 -> ContextWindowMismatch
+  [NOTE] /api/ps reports context_length=4096 for qwen3:8b, matching the configured 4096
+
+== hold                                                        40 samples, one every 15 s
+  +   0s  lease=active tenant=True free=8512 committed=5462 ghost=0
+  ...
+  +585s  lease=active tenant=True free=8514 committed=5462 ghost=0
+  [PASS] 1. a lease held 10 continuous minutes, visible in /v1/status throughout
+         603s held, 40 samples, 0 of them not showing an active lease + tenant;
+         committed 5462->5462 MiB, ghost stayed 0
+
+== the teardown that follows the release          (release does NOT free VRAM; linger does)
+  event 2200 lingering       last lease gone; lingering 180s
+  event 2202 stopping        idle_linger_elapsed
+  event 2203 evict_verified  5467 MiB of an expected 5416 MiB came back (ollama:qwen3:8b)
+  event 2204 stopped
+  [PASS] 2. release frees within verify_freed_fraction and books no ghost
+         freed 5467 of an expected 5416 MiB (1.01, policy floor 0.8); after teardown:
+         committed=0 ghost=0 free=13975 tenants=[] /api/ps=[]
+
+PHASE 2 GATE: PASSED - 7 of 7 checks, covering all five
+```
+
+Two honest caveats on those numbers. The acquire went ACTIVE in **15.3 s, not ~190 s** —
+the model had been loaded and unloaded minutes earlier, so the 5 GB blob and its Defender
+scan were both still in the Windows file cache. That is the same trap the `gpu-box` skill
+warns about for disk benchmarks, and it applies to a second *lease* too: **this run did not
+exercise a genuinely cold load.** And `expected_mib` was 5416 rather than policy's booked
+5462, because warden verifies against what it last *measured*, not against `cost_mib`.
+
+Eighteen further checks run with no warden and no card at all
+(`venv/bin/python tools/test_lease_offline.py`), covering what a real run cannot easily
+reach: a signal arriving *during* the acquire, a body that swallows every cancellation, a
+second signal into a wedged loop, an `/api/ps` serving a CPU-split model, and one whose
+only context length is the architectural maximum hiding in `details`.
 
 ### Phase 3 — vision on the box. The first multimodal model this machine has ever run.
 
