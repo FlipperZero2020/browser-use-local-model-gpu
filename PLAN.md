@@ -686,6 +686,23 @@ Ordered by how expensive the surprise is.
     plus **three 712 MB copies of the real Chrome profile**, cookies and `Login Data`
     included, sitting world-unreadable but undeleted in `/tmp`. All 32 removed in Phase 0;
     `tools/sweep_tmp.py` is the sweep, and it covers both prefixes.
+- **One outbound call has no kill switch at all.**
+  `browser/watchdogs/aboutblank_watchdog.py:180` injects
+  `img.src = 'https://cf.browser-use.com/logo.svg'` into the overlay it paints on
+  `about:blank` tabs. No env var gates it, and it is issued by the **browser**, not by
+  Python — so the four-name zero-cloud block does not touch it and neither would a
+  filtering proxy on `:11434`. "Zero cloud API calls" is true of the LLM path and of
+  telemetry; it is not yet true of the browser. Phase 4 has to decide whether to block the
+  host at the browser or accept it and say so.
+- **`beta/service.py:4578` calls the version check with no `BROWSER_USE_VERSION_CHECK`
+  gate.** The mainline `Agent` honours the switch; the beta service does not. Do not use it.
+- **There are four `/tmp` families, not one, and the biggest count is the one nobody
+  named.** `browser-use-downloads-*` is created on *every* `BrowserProfile` construction —
+  142 of them against 10 user-data-dirs on this VM — plus `browser_use_agent_<uuid>_<epoch>`
+  per `Agent()`, and `browseruse-tmp-*`. **CDP attach does not avoid them**: passing
+  `browser_session` makes `browser_profile` ignored, but the profile objects are still
+  built. The only real fix is `os.environ['TMPDIR'] = …` as the first statement of the
+  entry point, before any `browser_use` import — measured to relocate all four.
 - **`user_data_dir=None` is not "no profile"** — it is a fresh temp profile, and passing it
   explicitly is not the trigger either way: `session.py` filters `None` kwargs out before
   the profile is built. Any path containing `chrome` triggers the 718 MB copytree, one-way,
