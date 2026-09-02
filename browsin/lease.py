@@ -75,7 +75,20 @@ DEFAULT_PRIORITY = 'interactive'
 #: How often the watcher thread re-checks `lost_event`. Two orders of magnitude below the
 #: 30 s heartbeat it is watching, so it contributes nothing measurable to the gate's
 #: "cancels within one heartbeat", and it costs one wakeup every quarter second.
+#:
+#: Nothing can go below that heartbeat. `_Heartbeat._run` is `while not
+#: self._stop.wait(self.interval)` — it sleeps the whole interval *before* beating, and
+#: only a beat's 404 sets `lost_event`. Warden has no push channel, so `ttl_s` is the only
+#: lever on detection latency: the cadence is `min(policy interval, ttl_s/3)`, and warden
+#: always sends 30, so `WardenClient(heartbeat_interval_s=…)` is never consulted.
 LOST_POLL_S = 0.25
+
+#: `Task.cancel()` is cooperative. A body parked in `asyncio.to_thread()` around a
+#: blocking HTTP POST does not see the cancellation until that POST returns, and a step
+#: that catches `CancelledError` broadly would swallow it outright. So the watcher keeps
+#: asking rather than asking once.
+REPEAT_CANCEL_S = 1.0
+REPEAT_CANCEL_MAX = 10
 
 #: Set by `warden hold` (PLAN.md §7, Phase 7). If it is already in the environment,
 #: somebody upstream is holding the card and acquiring a second lease would double-book it.
@@ -236,6 +249,13 @@ class _LostWatcher:
 
 	Idempotent: `stop()` twice is fine, and firing after the loop has closed is a no-op
 	rather than a `RuntimeError` on a dead loop.
+
+	What it cannot see: `lost_event` fires only on a genuine 404. A warden that is merely
+	*unreachable* is transient by construction (`_Heartbeat._run` swallows
+	`WardenUnreachable` and keeps beating), so during a warden outage there is no signal
+	at all — and one such beat can occupy the heartbeat thread for ~240 s, four attempts
+	at a 60 s timeout plus backoff. Losing warden and losing the lease are different
+	events and only the second one reaches here.
 	"""
 
 	def __init__(self, lost_event: threading.Event, loop: asyncio.AbstractEventLoop,
@@ -260,16 +280,21 @@ class _LostWatcher:
 
 	def _run(self) -> None:
 		while not self._stop.is_set():
-			if not self._lost.wait(LOST_POLL_S):
-				continue
-			if self._stop.is_set():
-				return
+			# Returns True immediately if it is already set — which it can be, because
+			# the heartbeat starts at acquire and `Held` only reaches us after
+			# `wait_active`, so a lease can be lost before we ever see the handle.
+			if self._lost.wait(LOST_POLL_S):
+				break
+		if self._stop.is_set():
+			return
+		for attempt in range(REPEAT_CANCEL_MAX):
+			if attempt and self._stop.wait(REPEAT_CANCEL_S):
+				return  # the holder acknowledged it and is unwinding; stop asking
 			try:
 				self._loop.call_soon_threadsafe(self._on_lost)
 			except RuntimeError:
-				# The loop closed while we were waiting. There is nothing left to cancel.
-				pass
-			return
+				# The loop closed while we were waiting. Nothing left to cancel.
+				return
 
 
 # ── what `hold()` yields ─────────────────────────────────────────────────────
@@ -416,11 +441,12 @@ async def hold(
 		            endpoint=held.endpoint, leased=True, held=held, lease=held.lease)
 
 		def on_lost() -> None:
-			if seen['lost']:
-				return
-			seen['lost'] = True
-			card.lost.set()
-			log.error('lease %s lost — cancelling the run', held.lease_id[:8])
+			if not seen['lost']:
+				seen['lost'] = True
+				card.lost.set()
+				log.error('lease %s lost — cancelling the run', held.lease_id[:8])
+			# Not guarded: the watcher re-fires because one cancel can be swallowed, and
+			# cancelling a task that has already finished is a harmless no-op.
 			task.cancel()
 
 		try:
@@ -442,9 +468,18 @@ async def hold(
 				yield card
 
 		except asyncio.CancelledError:
-			# Clear the pending cancellation before unwinding: the release below is an
-			# `await`, and on a task still marked cancelling it would be interrupted
-			# before it could give the card back.
+			# Order matters. Stop the watcher before anything else, or its repeat-cancel
+			# re-marks this task as cancelling and the release below — an `await` — is
+			# interrupted before it can give the card back.
+			if watcher is not None:
+				watcher.stop()
+			if not (seen['lost'] or seen['signal']):
+				# Somebody else cancelled us. Leave the cancellation intact and let it
+				# propagate: rewriting it would destroy their signal, and `asyncio.run`
+				# turns an untouched CancelledError back into the KeyboardInterrupt it
+				# came from.
+				raise
+			# Ours. Clear it so the release can await, then say what actually happened.
 			task.uncancel()
 			if seen['lost']:
 				raise LeaseLost(
@@ -452,12 +487,10 @@ async def hold(
 					f'the run was cancelled rather than left talking to an unloaded model',
 					state='revoked', lease_id=held.lease_id,
 				) from None
-			if seen['signal']:
-				raise Interrupted(
-					f'{seen["signal"]} during {workload}; the lease was released',
-					signal=seen['signal'],
-				) from None
-			raise
+			raise Interrupted(
+				f'{seen["signal"]} during {workload}; the lease was released',
+				signal=seen['signal'],
+			) from None
 		finally:
 			if watcher is not None:
 				watcher.stop()
