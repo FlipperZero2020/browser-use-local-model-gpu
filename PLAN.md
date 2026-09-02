@@ -1,8 +1,11 @@
 # browser_use_local_model_GPU — lease the card, then let a local model drive a browser
 
-> **Status: 2026-09-01 — Phase 1 PASSED.** The grammar gate is cleared: browser-use's real
-> 21,980-char `AgentOutput` schema compiles into a working Ollama grammar on this box, in
-> 8.1 s, and qwen3's thinking mode does *not* break it. Phases 0 and 2–7 are unbuilt.
+> **Status: 2026-09-01 — Phases 0, 1 and 2 PASSED.** The grammar gate is cleared
+> (browser-use's real 21,980-char `AgentOutput` schema compiles into a working Ollama
+> grammar in 8.1 s, and qwen3's thinking mode does *not* break it), the repo is pinned and
+> makes no cloud calls, and `browsin/lease.py` holds the card from asyncio and gives it back
+> on every path out — including the SIGTERM that stranded one during Phase 1. Phases 3–7 are
+> unbuilt; **Phase 3 needs the owner** before it can start.
 > This file is the design doc and the status log. Everything under "Verified today" was measured live against
 > `192.168.1.111` and against this VM on 2026-09-01; everything else is marked
 > `[ASSUMPTION]` or `[VERIFY]` and is somebody's job to settle before it is trusted.
@@ -312,8 +315,15 @@ and inside, five obligations:
 
 1. **Acquire → `wait_active` → heartbeat.** The cadence is `min(heartbeat_interval_s or 30,
    ttl_s/3)`, computed once at acquire, and the first beat lands at `t=interval`, not `t=0`.
-2. **Wire `held.lost_event` to cancellation.** It is a `threading.Event`; bridge it to
-   asyncio with `loop.add_reader`/`run_in_executor` and cancel the agent task. **Polling
+2. **Wire `held.lost_event` to cancellation.** It is a `threading.Event`. ~~Bridge it with
+   `loop.add_reader`/`run_in_executor`.~~ **Corrected by measurement:** `to_thread(evt.wait)`
+   cannot be stopped — cancelling the await leaves the worker blocked forever, pinning
+   `asyncio.run`'s shutdown for up to `THREAD_JOIN_TIMEOUT` (300 s) and burning an executor
+   slot the warden client itself needs; and a `socketpair` + `add_reader` still needs a
+   thread to notice the Event, plus two file descriptors `loop.close()` does not close. What
+   ships is a daemon watcher thread polling `lost_event.wait(0.25)` and routing
+   `task.cancel()` through `loop.call_soon_threadsafe` — the only call that is safe from
+   that thread, and one that raises `RuntimeError` on a closed loop. **Polling
    `:11434` tells you nothing** — warden is a control plane, not a proxy, so when it
    revokes your lease it unloads the model and the endpoint *keeps answering*. The next
    request silently reloads several GB outside warden's book and the session looks healthy.
@@ -323,9 +333,14 @@ and inside, five obligations:
    tag. This is two seconds of work that turns an OOM at step 12 into an error at step 0.
 4. **Assert `num_ctx`.** Compare the configured window against the policy entry's measured
    window (§3.1) and refuse to start on a mismatch.
-5. **Release on every path.** `finally` + `atexit` cover exceptions and Ctrl-C. `SIGKILL`
-   does not — the lease then sits for `ttl_s + idle_linger_s`. A shorter `--ttl` is the
-   only lever; default to 120 s, not policy's 300.
+5. **Release on every path.** `finally` + `atexit` cover exceptions and Ctrl-C. A **default
+   `SIGTERM` does not** — Python runs neither for one, which is how Phase 1 stranded a
+   lease — so the handlers go on *before* the acquire, not after, or a signal during a
+   ~190 s cold load is still a bare kill. `SIGKILL` is uncoverable and the lease then sits
+   for `ttl_s + idle_linger_s`; a shorter `--ttl` is the only lever, default 120 s rather
+   than policy's 300. And a cancel during the acquire needs an explicit DELETE: warden's
+   async facade drives a *sync* context manager through `to_thread(cm.__enter__)`, so
+   cancelling that await leaves a live, heartbeating lease whose `__exit__` never runs.
 
 If `$WARDEN_ENDPOINT` is already set — i.e. somebody ran us under a future `warden hold`
 — **do not double-lease**. Use the endpoint given, skip acquire, and say so.
@@ -426,7 +441,7 @@ When `browser_session` is passed, **`browser_profile` is ignored entirely**
 | `executable_path` silently rewriting `user_data_dir` | **gone** — neither is set |
 | Silent 30 s stall on a browser that starts then dies | **gone** — nothing is launched |
 | Stale `SingletonLock` (dead PID 153182) in `chrome-default` | **gone** — Chrome resolves its own lock at startup |
-| `/tmp/browser-use-user-data-dir-*` leak per `import browser_use` | **still there** (module-level default), but stays a 4 KB stub |
+| `/tmp/browser-use-user-data-dir-*` leak per `import browser_use` | **the premise was wrong** — the import leaks nothing, and CDP attach does not avoid the four families that *are* real (§7) |
 
 What `bin/browsin` must therefore do before it leases anything:
 
@@ -532,7 +547,7 @@ matching llama.cpp's own `5319 MiB` projection and warden's booked 5462. Release
 **no ghost**. The approach is viable; what is *not* yet established is behaviour at a real
 browser step's prompt size (§3.3).
 
-### Phase 2 — `lease.py`. Still no browser, still no vision.
+### Phase 2 — `lease.py`. ✅ **PASSED 2026-09-01**
 
 Build §4.2. `AsyncWardenClient` has never run against this box.
 
@@ -541,6 +556,19 @@ Build §4.2. `AsyncWardenClient` has never run against this box.
 ghost** · Ctrl-C mid-hold releases cleanly · the `/api/ps` assertion catches a deliberately
 wrong model name · `lost_event` fires and cancels within one heartbeat when the lease is
 released out from under it.
+
+`browsin/lease.py` is the module; `tools/phase2_gate.py` is the gate;
+`tools/test_lease_offline.py` is the eighteen things that can be proven against a fake
+warden client in a second rather than in a 190-second cold load — including the cases a
+real run cannot easily reach, like a signal arriving *during* the acquire.
+
+**The gate had to be repaired three times before it was worth trusting**, and every repair
+came from running it rather than reading it. §10 records what each one was. The rule this
+phase actually established is narrower than "test it": *a gate that cannot fail has not
+passed*, and the way to find out which kind you have is to make it grade a run you
+deliberately broke.
+
+@@GATE_OUTPUT@@
 
 ### Phase 3 — vision on the box. The first multimodal model this machine has ever run.
 
@@ -955,3 +983,91 @@ first failure was blamed for the second, the clean-card rerun disproved it, and 
 `llama-server started in 187.90 seconds` log line settled it. The measurement decided it,
 not the reasoning about it — which is the same rule §5 already applies to the agent's own
 `done` action.
+
+
+**2026-09-01, Phases 0 and 2 — PASSED. The repo exists; the card can be held and given
+back.** `git init`, the pins, the zero-cloud block, the `**kwargs` guard, `CLAUDE.md`,
+`browsin/lease.py`, and three tools: `phase0_gate.py`, `phase2_gate.py` and
+`test_lease_offline.py`. Both gates' actual output is pasted in §5 rather than summarised.
+
+**The headline is a finding about gates, not about leases.** Between them these two phases
+produced **four false passes**, every one of which looked like a green tick:
+
+1. **The plan's own Phase 0 gate is a false pass as written.** `'posthog' not in
+   sys.modules` after importing `Agent` is `True` *with telemetry fully enabled* — the
+   import is lazy inside `ProductTelemetry.__init__`, so it happens at Agent
+   **construction**. `phase0_gate.py` now runs the literal wording, then constructs
+   `ProductTelemetry` and checks the client, then runs the whole probe a third time with
+   telemetry ON as a **negative control**, so the two checks are known to differ rather
+   than assumed to.
+2. **Gate 2 "passed" in about a second** by reading `freed_mib` at the top level of an
+   event, where it is `None` — the numbers live under `fields` — and by scanning the whole
+   event log, so it matched an `evict_verified` from an earlier run and never waited out
+   the 180 s linger.
+3. **The standalone `freed` watcher ran by default** with `since_id=0` after the real check
+   had already run, matched a degenerate `evict_verified: 0 MiB of an expected 0 MiB` from
+   hours earlier, and made one run report both PASS and FAIL for the same gate.
+4. **`--only <typo>` skipped every step and printed `PASSED`, exit 0.** Three more of the
+   same family were found by adversarial review and fixed before the final run: gate 5
+   graded a `LeaseLost` raised during the *acquire* against a clock started before it;
+   gate 3 accepted "warden has no record of this lease" — which means warden *restarted* —
+   as proof of a release; gate 4 counted any `NotResident`, including "nothing is resident".
+
+Ten findings the design did not have, all measured:
+
+1. **`/api/ps` reports the served context window**, top-level `context_length`, 4096 for
+   `qwen3:8b` against an architectural maximum of 40960. Obligation 4 is therefore
+   checkable from the client, which §4.2 could only hope for. It is *not* readable from
+   `details`, which carries the model's metadata — reading that would turn "I could not
+   check" into a confident wrong answer.
+2. **Residency is not the same as being on the card.** `/api/ps` returns `size` and
+   `size_vram`; their ratio is exactly how `ollama ps` computes its GPU% column. Ollama
+   silently splits a model across CPU and GPU when it does not fit, and warden books the
+   lease as VRAM either way — so obligation 3 has to compare the two numbers or it
+   certifies a card that is not holding the model.
+3. **Lease-loss detection has a 30-second floor** and no bridge lowers it:
+   `_Heartbeat._run` sleeps the whole interval *before* beating, warden has no push
+   channel, and `WardenClient(heartbeat_interval_s=…)` is never consulted because warden
+   always sends 30. `ttl_s` is the only lever. Polling `GET /v1/leases/{id}` *is* faster
+   and is left to Phase 4, where a step can run for minutes.
+4. **A cancel during the acquire leaves a live, heartbeating lease.**
+   `AsyncWardenClient.lease` drives a sync context manager through
+   `asyncio.to_thread(cm.__enter__)`; cancelling that await detaches the coroutine while
+   the worker thread completes the acquire and parks at the yield, and `cm.__exit__` never
+   runs. `hold()` issues the DELETE itself on that path.
+5. **`Task.cancel()` is cooperative**, so a body parked in a blocking call — the normal
+   state of a browser agent mid-step — does not see it until that call returns, and a body
+   that catches `CancelledError` broadly can outlast the cancel and **return normally after
+   the lease is gone**. That silent success was the worst bug in the module. Re-firing the
+   cancel defeats it, but re-firing *too fast* chops up the body's own async cleanup: 5 s ×
+   3 is the settled trade-off, and a body needing longer is cut short on purpose.
+6. **browser-use's own signal handler ends in `os._exit(0)`** (`utils.py:290`), which runs
+   no `atexit` at all. `enable_signal_handler=False` is not a preference for a lease
+   holder, it is required.
+7. **An empty-string env var is not "unset" to browser-use.** `'' in 'ty1'` is `True`, so a
+   blank `ANONYMIZED_TELEMETRY` reads as *enabled* — and `FlatEnvConfig` cannot parse it as
+   a bool, so `import browser_use` raises outright. `os.environ.setdefault` sees neither.
+8. **`import browser_use` leaks nothing** — §7's bullet was wrong in both its trigger and
+   its mechanism. There are four `/tmp` families, the one that actually accumulates is
+   `browser-use-downloads-*` (142 against 10 user-data-dirs), and **CDP attach does not
+   avoid any of them** because the profile objects are still constructed. `TMPDIR` is the
+   only real mitigation. 2.1 GB swept, three of those dirs being 712 MB copies of the real
+   Chrome profile, cookies and `Login Data` included.
+9. **One outbound call has no kill switch**: `aboutblank_watchdog.py:180` injects
+   `cf.browser-use.com/logo.svg` into the `about:blank` overlay. It is issued by the
+   *browser*, so neither the env block nor a proxy on `:11434` touches it. "Zero cloud" is
+   true of the LLM path and of telemetry; it is not yet true of the browser, and Phase 4
+   has to decide that.
+10. **A warm Windows file cache hides the cold-load problem.** After one load-and-unload
+    cycle the same acquire goes ACTIVE in ~15 s rather than ~190 s, because the 5 GB blob
+    and its Defender scan are both cached. The gpu-box skill already warns not to read a
+    second read as a disk measurement; the same applies to a second *lease*. The Defender
+    exclusion is still unapplied, so the 190 s figure stands for a genuinely cold load.
+
+One process note, and it is the same one Phase 1 recorded. Stopping a contaminated gate run
+stranded a lease, because every `hold()` inside the harness passes `handle_signals=False`
+on purpose — the gate must measure `lease.py`'s signal behaviour in a *child*, not have it
+fire mid-measurement — which left the harness itself taking a bare SIGTERM. The fix is one
+line (`SIGTERM` → `SystemExit`, so warden's `atexit` runs), and the lesson is the one §7
+already states: **the thing that holds the lease is not always the thing you remembered to
+protect.** Card returned to `committed 0 · ghost 0 · free ~13910` after every run.

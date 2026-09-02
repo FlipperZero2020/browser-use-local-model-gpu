@@ -229,6 +229,19 @@ def gate_signal(sync: WardenClient, signum: int) -> None:
 
 # ── gate 4 (and obligation 4): the assertions catch a wrong answer ───────────
 async def gate_assertions(warden: AsyncWardenClient) -> None:
+	try:
+		await _gate_assertions(warden)
+	except ContextWindowUnknown as err:
+		# hold() asserts the window inside __aenter__, so on an Ollama that stops reporting
+		# a context length this escapes the `async with` and the handler further down never
+		# runs. That must FAIL rather than pass quietly: obligation 4 is the one that keeps
+		# warden's book honest, and "I could not check it" is not "it was fine".
+		record('4b. the num_ctx assertion catches a wrong window', False,
+		       f'UNPROVEN — this Ollama does not report a context length on /api/ps, so '
+		       f'obligation 4 cannot be checked from the client at all: {str(err)[:220]}')
+
+
+async def _gate_assertions(warden: AsyncWardenClient) -> None:
 	async with hold(WORKLOAD, reason='browsin phase 2 gate 4 (assertions)',
 	                num_ctx=EXPECTED_NUM_CTX, handle_signals=False) as card:
 		print(f'  resident: {json.dumps(await asyncio.to_thread(_ps_summary, card.endpoint))}',
@@ -262,9 +275,9 @@ async def gate_assertions(warden: AsyncWardenClient) -> None:
 			record('4b. the num_ctx assertion catches a wrong window', True,
 			       f'assert_context_window(..., {wrong_ctx}) raised: {str(err)[:150]}')
 		except ContextWindowUnknown as err:
-			note('4b. the num_ctx assertion catches a wrong window',
-			     f'UNPROVEN — this Ollama does not report a context length on /api/ps, so '
-			     f'obligation 4 cannot be checked from the client: {str(err)[:200]}')
+			record('4b. the num_ctx assertion catches a wrong window', False,
+			       f'UNPROVEN — this Ollama does not report a context length on /api/ps, so '
+			       f'obligation 4 cannot be checked from the client: {str(err)[:200]}')
 		else:
 			record('4b. the num_ctx assertion catches a wrong window', False,
 			       f'it returned {served} instead of rejecting {wrong_ctx}')
