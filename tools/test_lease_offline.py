@@ -189,6 +189,25 @@ async def case_external_cancel() -> None:
 		      [k for k, _ in w.journal].count('released') == 1, str(w.journal))
 
 
+async def case_inherited_endpoint() -> None:
+	"""$WARDEN_ENDPOINT means somebody else holds the card — and we cannot see them lose it."""
+	os.environ['WARDEN_ENDPOINT'] = 'http://127.0.0.1:1'
+	try:
+		async with hold('ollama:qwen3:8b', verify=False, handle_signals=True) as card:
+			checked_silently = False
+			try:
+				card.check()
+				checked_silently = True
+			except LeaseLost:
+				pass
+			check('check() fails closed when no lease is held',
+			      not checked_silently and not card.leased and card.held is None,
+			      'obligation 2 has no channel here, so check() must not answer "fine"'
+			      if checked_silently else 'raises LeaseLost rather than returning silently')
+	finally:
+		os.environ.pop('WARDEN_ENDPOINT', None)
+
+
 # ── the /api/ps assertions, against a stub that answers whatever we like ─────
 import http.server  # noqa: E402
 import json as _json  # noqa: E402
@@ -354,7 +373,7 @@ def run_child(name: str, *, delay: float, body: str, signals: int, wait_for_hold
 async def main() -> int:
 	print('\nin-process (fake warden):')
 	for case in (case_normal, case_body_raises, case_verify_fails, case_lost,
-	             case_swallows_cancel, case_external_cancel):
+	             case_swallows_cancel, case_external_cancel, case_inherited_endpoint):
 		await case()
 
 	print('\nthe /api/ps assertions, against a stub:')

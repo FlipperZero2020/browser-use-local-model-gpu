@@ -487,16 +487,27 @@ async def main() -> int:
 			record(f'({name}) raised', False, f'{type(err).__name__}: {str(err)[:220]}')
 
 	print('\n' + '=' * 78)
+	if not results:
+		print('PHASE 2 GATE: NOTHING RAN — no step produced a result')
+		return 1
 	width = max(len(g) for _s, g, _d in results)
 	for status, gate, detail in results:
 		print(f'  [{status}] {gate.ljust(width)}  {detail}')
 	checks = [r for r in results if r[0] != 'NOTE']
 	failed = [g for s, g, _d in checks if s == 'FAIL']
 	print()
-	if failed:
-		print(f'PHASE 2 GATE: FAILED — {len(failed)} of {len(checks)}: {", ".join(failed)}')
+	if not checks:
+		print('PHASE 2 GATE: NOTHING RAN — every result was a NOTE, which cannot gate')
 		return 1
-	print(f'PHASE 2 GATE: PASSED — {len(checks)} of {len(checks)} checks')
+	# Say what was covered. A partial run that prints a bare "PASSED" reads as a full one,
+	# and `--only` exists precisely so partial runs are easy.
+	covered = ('all five gates' if selected == default_steps
+	           else 'ONLY ' + ', '.join(sorted(selected)) + ' — this is a partial run')
+	if failed:
+		print(f'PHASE 2 GATE: FAILED — {len(failed)} of {len(checks)} '
+		      f'({covered}): {", ".join(failed)}')
+		return 1
+	print(f'PHASE 2 GATE: PASSED — {len(checks)} of {len(checks)} checks, {covered}')
 	return 0
 
 

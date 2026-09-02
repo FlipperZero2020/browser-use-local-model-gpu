@@ -833,6 +833,14 @@ Ordered by how expensive the surprise is.
   *untouched* `CancelledError` back into the `KeyboardInterrupt` it came from, so
   rewriting a cancellation you did not cause destroys the caller's signal. Convert only
   the ones you raised, and `uncancel()` only those.
+- **`$WARDEN_ENDPOINT` turns obligation 2 off, and nothing sets it.** The short-circuit in
+  §4.2 — "use the endpoint given, skip acquire, and say so" — means this process holds no
+  lease, runs no heartbeat, and therefore has *no revocation channel at all*, while
+  `:11434` keeps answering exactly as it does after any eviction. `Card.check()` now fails
+  closed on that path rather than returning quietly, and the "say so" is a WARNING rather
+  than an INFO, because under default logging (root at WARNING, no handler) an INFO record
+  is dropped and the branch produces no output whatsoever. Nothing in this repo or in
+  warden sets the variable; today it can only come from a stale export.
 - **`Agent(enable_signal_handler=...)` defaults to `True`, and its second Ctrl-C is
   `os._exit(0)`** (`browser_use/utils.py:290`). `os._exit` runs no `atexit` at all, so
   browser-use's handler does not merely fight the lease holder's — it defeats warden's own

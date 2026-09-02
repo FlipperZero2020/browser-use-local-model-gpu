@@ -246,9 +246,11 @@ def assert_resident(endpoint: str, workload_or_tag: str, *, exact: bool = True,
 	if want not in seen:
 		if not models:
 			raise NotResident(
-				f'{endpoint}/api/ps shows nothing resident, but warden granted a lease for '
-				f'{want}. The lease is active and the model is not loaded — that is warden '
-				f'and Ollama disagreeing, not a slow load: wait_active already returned.'
+				f'{endpoint}/api/ps shows nothing resident, but {want} was expected to be. '
+				f'On a leased path that is warden and Ollama disagreeing rather than a slow '
+				f'load, because wait_active has already returned; on an inherited endpoint it '
+				f'means the upstream holder\'s lease has already closed and the model was '
+				f'unloaded behind it.'
 			)
 		raise NotResident(
 			f'{endpoint}/api/ps shows {sorted(seen)} resident, not {want}. '
@@ -392,11 +394,27 @@ class Card:
 		return heartbeat_interval_for(self.lease) if self.lease is not None else None
 
 	def check(self) -> None:
-		"""Raise `LeaseLost` if the lease went away. Cheap; call it between steps."""
+		"""Raise `LeaseLost` if the lease went away. Cheap; call it between steps.
+
+		**Fails closed on the inherited path.** When `$WARDEN_ENDPOINT` was set this process
+		holds no lease, runs no heartbeat, and therefore has no revocation channel at all —
+		and returning quietly would be the worst answer available, because the whole point
+		of calling `check()` between steps is to find out. warden will evict the upstream
+		holder like any other tenant, and `:11434` keeps answering afterwards.
+		"""
 		if self.held is not None:
 			self.held.check()
-		elif self.lost.is_set():
+			return
+		if self.lost.is_set():
 			raise LeaseLost(f'lease for {self.workload} is gone', state='gone')
+		if not self.leased:
+			raise LeaseLost(
+				f'this process holds no lease on {self.workload} — it inherited '
+				f'${ENDPOINT_ENV} — so there is no heartbeat and no way to know whether the '
+				f'upstream holder still has the card. check() cannot answer, and answering '
+				f'"fine" would be a guess. Take the lease here, or stop calling check().',
+				state='unknown',
+			)
 
 
 # ── signals ──────────────────────────────────────────────────────────────────
@@ -522,7 +540,16 @@ async def hold(
 	if inherited:
 		# Somebody upstream — a future `warden hold` — already has the card. Taking a
 		# second lease would double-book it against ourselves.
-		log.info('%s is set; using the inherited endpoint and not acquiring a lease', ENDPOINT_ENV)
+		# WARNING, not INFO: §4.2 says "say so", and under default logging — root at
+		# WARNING with no handler, which is what a library consumer has — an INFO record is
+		# dropped and this branch produces no output whatsoever.
+		log.warning(
+			'%s=%s is set, so no lease is being acquired and this process has NO revocation '
+			'channel: obligation 2 is off, Card.check() will refuse to answer, and '
+			'handle_signals is inert because there is nothing to release. Nothing in this '
+			'repo sets that variable — if you exported it by hand, unset it.',
+			ENDPOINT_ENV, inherited,
+		)
 		card = Card(workload=workload, model_tag=tag, endpoint=inherited, leased=False)
 		if assertable:
 			await _run_assertions(card, tag, num_ctx, exact_residency)
@@ -540,7 +567,7 @@ async def hold(
 		if on_state is not None:
 			on_state(view)
 
-	seen: dict[str, Any] = {'signal': None, 'lost': False, 'lease_id': None}
+	seen: dict[str, Any] = {'signal': None, 'lost': False, 'lease_id': None, 'entered': False}
 	watcher: _LostWatcher | None = None
 
 	def release_sync() -> None:
@@ -584,6 +611,10 @@ async def hold(
 				raise_if_lost=False,
 			) as held:
 				seen['lease_id'] = held.lease_id
+				# From here on warden's own `__exit__` will release, so the belt-and-braces
+				# DELETE below must NOT also fire: two DELETEs per shutdown is a 404 and a
+				# wasted round trip, and it reads as confusion about who owns the release.
+				seen['entered'] = True
 				card = Card(workload=workload, model_tag=tag, endpoint=held.endpoint,
 				            leased=True, held=held, lease=held.lease)
 
@@ -641,14 +672,16 @@ async def hold(
 		# `asyncio.timeout` the caller enters.
 		while task.cancelling():
 			task.uncancel()
-		# And give the card back by hand. `AsyncWardenClient.lease` drives a *sync*
-		# context manager through `asyncio.to_thread(cm.__enter__)`; cancelling that await
-		# only detaches the coroutine. The worker thread finishes the acquire, starts the
-		# heartbeat and parks at the yield, and `cm.__exit__` is never called — so a
-		# cancellation during a ~190 s cold load leaves a live, heartbeating lease that
-		# only warden's `atexit` collects, and only if the process actually exits. This
-		# DELETE is idempotent and a 404 is not an error.
-		release_sync()
+		# If the cancellation landed *before* the `async with` bound, give the card back by
+		# hand. `AsyncWardenClient.lease` drives a *sync* context manager through
+		# `asyncio.to_thread(cm.__enter__)`; cancelling that await only detaches the
+		# coroutine. The worker thread finishes the acquire, starts the heartbeat and parks
+		# at the yield, and `cm.__exit__` is never called — so a cancellation during a
+		# ~190 s cold load leaves a live, heartbeating lease that only warden's `atexit`
+		# collects, and only if the process actually exits. Past that point warden's own
+		# `__exit__` owns the release and this would only be a second DELETE.
+		if not seen.get('entered'):
+			release_sync()
 		if seen['lost']:
 			raise LeaseLost(
 				f'lease {seen["lease_id"]} for {workload} was revoked while it was held; '
