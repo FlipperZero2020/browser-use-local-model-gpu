@@ -1,11 +1,13 @@
 # browser_use_local_model_GPU — lease the card, then let a local model drive a browser
 
-> **Status: 2026-09-01 — Phases 0, 1 and 2 PASSED.** The grammar gate is cleared
+> **Status: 2026-09-04 — Phases 0 through 3 PASSED.** The grammar gate is cleared
 > (browser-use's real 21,980-char `AgentOutput` schema compiles into a working Ollama
 > grammar in 8.1 s, and qwen3's thinking mode does *not* break it), the repo is pinned and
-> makes no cloud calls, and `browsin/lease.py` holds the card from asyncio and gives it back
-> on every path out — including the SIGTERM that stranded one during Phase 1. Phases 3–7 are
-> unbuilt; **Phase 3 needs the owner** before it can start.
+> makes no cloud calls, `browsin/lease.py` holds the card from asyncio and gives it back
+> on every path out — including the SIGTERM that stranded one during Phase 1 — and the
+> first vision model is on the box, measured (**8375 MiB**), declared as
+> **`ollama:qwen2.5vl-32k:7b`** (a derived Modelfile tag, not the bare pull — see Phase 3),
+> and leased/round-tripped end to end through this VM. Phases 4–7 are unbuilt.
 > This file is the design doc and the status log. Everything under "Verified today" was measured live against
 > `192.168.1.111` and against this VM on 2026-09-01; everything else is marked
 > `[ASSUMPTION]` or `[VERIFY]` and is somebody's job to settle before it is trusted.
@@ -58,14 +60,14 @@ Settled 2026-09-01 by the owner; recorded here so they are not re-litigated.
 | Decision | Choice |
 |---|---|
 | Lease mechanism | **In-process**, via `warden.client` imported into this venv. Composes under `warden hold` if that CLI is ever built; does not wait for it |
-| Model | **Pull a vision model now** — **`qwen2.5vl:7b`**, chosen for web/OCR strength over `minicpm-v:8b`'s ~500 MiB saving. Text-only is the control, not the destination |
+| Model | **Pull a vision model now** — **`qwen2.5vl:7b`**, chosen for web/OCR strength over `minicpm-v:8b`'s ~500 MiB saving. Text-only is the control, not the destination. **Declared as `qwen2.5vl-32k:7b`, a derived Modelfile tag** — the bare pull serves `num_ctx=4096` and fails Phase 3's obligation-4 assertion (§10, Phase 3) |
 | Context window | **`num_ctx` = 32768.** ~1 GB more KV than 16k, bought deliberately: overflow here is silent (§3.2), not an error |
 | Measurement window | **`clonin-frontdoor` goes down for ~10 minutes; warden stays up.** A second engine alongside the live service is accepted |
 | Priority | **`interactive`, `may_evict` ON** |
 | Shape | **Full client shape** — PATH command, config file, repo `CLAUDE.md`, Claude skill |
 | Command name | **`browsin`** — `browse` is taken (`/usr/bin/browse` → `xdg-open`). Matches the house naming: cloning→`clonin`, browsing→`browsin` |
 | Browser | **Attach to the owner's real Chrome over CDP.** Not a launched browser, not a copied profile — real, current logins, and writes persist because it *is* the daily browser |
-| clonin interlock | **None for now.** On §3.4's estimates the chosen model co-resides with the voice service, so there is nothing to interlock. Revisit only if Phase 3's measurement takes the margin away |
+| clonin interlock | **Warn and ask, per run** — settled 2026-09-04 after Phase 3's measurement killed the co-residency estimate it was previously moot on. `browsin` checks whether clonin is resident *before* acquiring and makes the owner choose; it never evicts the public voice service silently |
 | Where it lives | This directory. Not a git repo yet; Phase 0 makes it one |
 
 ### Three corrections to the premises those choices were made on
@@ -259,7 +261,9 @@ than hard-refusing.
 
 **Decided 2026-09-01: `qwen2.5vl:7b`**, with `minicpm-v:8b` as the fallback if it disappoints
 and `gemma3:4b` as the *smoke test* — 3.3 GB is the cheapest way to learn whether this
-Ollama build runs any vision architecture at all.
+Ollama build runs any vision architecture at all. **Measured 2026-09-04 at 8375 MiB
+(§10, Phase 3), declared as the derived tag `qwen2.5vl-32k:7b`** — **11.5% above** the
+estimate, which is what removed the co-residency margin (§10, 2026-09-04).
 
 At the decided 32k window `qwen2.5vl:7b` needs ~8,265 MiB after the safety factor, against
 8,763 MiB of book remaining with clonin resident — so on these **estimates** it co-resides
@@ -452,6 +456,15 @@ What `bin/browsin` must therefore do before it leases anything:
      the CDP port at startup; it cannot be enabled on a running instance.
    - not running → offer to start it, with the real profile and the debug port.
 3. **Never bind the debug port to anything but loopback** (see §7).
+4. **Check whether clonin is resident, and if it is, stop and ask.** Phase 3 measured the
+   vision model at **8,375 MiB**, needing **9,213** after the ×1.10 factor against the
+   **8,763** of book left when clonin holds its 3,726 — a **450 MiB deficit**. So an
+   `interactive` acquire does not co-reside with the voice service, it *evicts* it, and
+   `clonin-frontdoor` is public: the sentence being cut off may belong to a stranger.
+   `GET /v1/status` and look for a clonin tenant; if there is one, print who would be
+   displaced and require an explicit `--evict` (or an interactive yes) rather than
+   proceeding. `--wait` queues instead, and clonin's `idle_linger_s` is 120 s, so the
+   normal wait is short.
 
 The command it should print, and the one the skill documents:
 
@@ -626,7 +639,7 @@ reach: a signal arriving *during* the acquire, a body that swallows every cancel
 second signal into a wedged loop, an `/api/ps` serving a CPU-split model, and one whose
 only context length is the architectural maximum hiding in `details`.
 
-### Phase 3 — vision on the box. The first multimodal model this machine has ever run.
+### Phase 3 — vision on the box. ✅ **PASSED 2026-09-04**
 
 1. **Smoke-test the architecture cheaply first.** Pull `gemma3:4b` (3.3 GB). Send one image
    with `format=<a trivial schema>`. This asks the only question that matters at this
@@ -653,6 +666,73 @@ only context length is the architectural maximum hiding in `details`.
 resident; one image + `format=` round-trips correctly; releasing frees within
 `verify_freed_fraction` with no ghost; the declared `cost_mib` is the **measured**
 load-drop, not the estimate in §3.4.
+
+**A finding step 4 did not anticipate: the bare pull cannot be the declared workload.**
+`ollama:qwen2.5vl:7b` loaded plain (warden's own load call passes no `options`, empty
+prompt) served `context_length=4096` — measured directly against `:11434` before touching
+warden at all. `browsin/lease.py`'s obligation-4 assertion compares the *served* window
+against the client's configured `num_ctx` and refuses to start on a mismatch (that is what
+the assertion is *for* — Phase 2's gate proved it by deliberately engineering exactly this
+mismatch). So the plan's own num_ctx=32768 decision would have failed obligation 4 on
+every single start, immediately, in production — not a hypothetical, since the served
+window is fixed at whatever the model's own default is, and nothing in the client's request
+options is consulted by warden's plain load. The fix is the same one already sitting unused
+on the box: a **derived Modelfile tag**, `qwen2.5vl-32k:7b` (`FROM qwen2.5vl:7b` +
+`PARAMETER num_ctx 32768`), exactly the pattern `qwen3-32k:8b` had already established
+(§2's model table) — created with `ollama create`, no re-download, four existing layers
+reused plus one new ~20 KiB parameter layer. Verified served at `context_length=32768`
+before it was ever declared in policy. **This is declared, not `qwen2.5vl:7b` bare** — the
+plan's §1/§3.4 references to `qwen2.5vl:7b` mean this derived tag in practice.
+
+**Gate output, 2026-09-04, from a quiet card (free 14127, foreign 2253, no tenants),
+`clonin-frontdoor` + its cloudflared tunnel gated for the measurement window:**
+
+```
+tools/measure_footprints.py ollama:qwen2.5vl-32k:7b --policy scratch_browsin/policy.json ...
+── ollama:qwen2.5vl-32k:7b ── card quiet at 14126 MiB free
+   ready in 18.3s, drop 8343 MiB (engine measured 8343)
+   warm drop 8369 MiB
+   freed 8375 MiB on evict, ghosts 0
+
+ workload                      budget   load    warm   freed  engine
+ ollama:qwen2.5vl-32k:7b        8265   8343    8369    8375    8343
+```
+
+`cost_mib` declared at **8375** (the evict-recovered figure, matching house convention for
+every other MEASURED entry) — **11.5% above** §3.4's pre-measurement estimate. The "within 1.3%" first written here
+compared unlike quantities: **8265 is a *need*** (estimated cost × the 1.10 safety factor),
+while **8375 is a *cost***. Like for like it is 7514 estimated cost → 8375 measured (+11.5%),
+or 8265 estimated need → 9213 measured need (+11.5%). The error mattered: at 1.3% the
+estimate looks validated, and at 11.5% it is what cost the co-residency margin. Backed up as
+`policy.json.pre-browsin-backup`; re-read after write confirmed every other workload and
+every top-level key byte-for-byte unchanged.
+
+Then the real gate, `tools/phase3_gate.py`, run from this VM through `browsin/lease.py`
+against the now-declared workload — no scratch engine, the actual production path:
+
+```
+[PASS] 1. lease granted from this VM   endpoint=http://192.168.1.111:11434 in 18.5s
+[PASS] 2. obligation 3+4 assertions passed inline (served num_ctx=32768)
+[PASS] 3. one image + format= round-trips correctly in 1.8s -> {'shape': 'triangle', 'color': 'green', 'text_seen': 'PHASE 3 GATE'}
+released cleanly, hold() exited with no exception
+```
+
+Release doesn't free VRAM immediately — the idle linger does, same pattern Phase 2 found —
+so the fourth condition was confirmed from warden's own event log after the 180s linger
+elapsed: `evict_verified — 8439 MiB of an expected 8368 MiB came back
+(ollama:qwen2.5vl-32k:7b)`, ratio 1.0085 against the 0.8 floor, `ghost_mib: 0`. Card
+returned to `free 14128 · foreign 2252 · ghost 0 · no tenants` — indistinguishable from
+its pre-measurement baseline.
+
+**One more data point, incidental to this phase but relevant to §10's 2026-09-03 entries
+below — read those first if this looks like it is re-claiming a fixed bug.** `qwen2.5vl:7b`
+and the derived `qwen2.5vl-32k:7b` were both **newly pulled/created files, loaded cold for
+the first time, with the Defender exclusion already in place** — exactly the case the
+corrected understanding says the exclusion actually helps (a first-ever scan is unavoidable
+either way, but nothing here needed a second one). Both loaded in the 13-23s normal range
+(18.1-18.3s engine-measured), not the 180-190s of 09-01's one bad window. This is a second,
+independent confirmation of the *corrected* claim — "add the exclusion before pulling a new
+model" — not of the earlier, retracted one that credited it with fixing a persistent slowdown.
 
 ### Phase 4 — one headed browser step, instrumented.
 
@@ -915,7 +995,7 @@ lost, and so a later reader can see which were decisions rather than findings:
 | Gate the public front door for it | yes |
 | `qwen2.5vl:7b` or `minicpm-v:8b` | `qwen2.5vl:7b`, fallback `minicpm-v:8b` |
 | `num_ctx` | 32768 |
-| clonin interlock | none for now — moot if §3.4's co-residency estimate holds |
+| clonin interlock | **reopened and re-settled 2026-09-04**: warn and ask per run. The measurement removed the margin it was moot on — see §10 |
 | The 829 MB Chrome profile | **attach to the real Chrome over CDP** (§4.4) |
 | The two stale project-scoped skills | **deleted 2026-09-01** — see §10 |
 | Does this project get an artifact | yes; published |
@@ -1135,3 +1215,80 @@ fire mid-measurement — which left the harness itself taking a bare SIGTERM. Th
 line (`SIGTERM` → `SystemExit`, so warden's `atexit` runs), and the lesson is the one §7
 already states: **the thing that holds the lease is not always the thing you remembered to
 protect.** Card returned to `committed 0 · ghost 0 · free ~13910` after every run.
+
+**2026-09-03 — the Defender exclusion is applied. Item 10 above is now stale.** Owner ran
+`Add-MpPreference -ExclusionPath "D:\Models\OLAM"` on the box, elevated. Verified two ways,
+not just read back from config: `Get-MpPreference | Select ExclusionPath` lists
+`D:\Models\OLAM` (alongside pre-existing `D:\hf-cache`, `D:\video`), and the path is the real
+Ollama store, not a typo'd/dead one — `blobs/` + `manifests/registry.ollama.ai/...` for
+`qwen3:8b`, `qwen2.5-coder:14b`, `nomic-embed-text`. Then, with Ollama not resident
+(`/v1/status` showed only `clonin`, no ollama tenant), a fresh `ollama:qwen3:8b` lease was
+taken from this VM to force a genuine cold load: acquired in 22.0 s, and
+`D:\warden\logs\ollama-server.log` shows `llama-server started in 16.31/16.37 seconds` at
+the matching timestamp. That is the *cold* number now — no warm-file-cache confound — well
+under both the 180 s the model used to miss by ~8 s and the 600 s `start_timeout_s` raised
+in Phase 1. The 190 s cold-load figure throughout §2/§3/Phase 1/item 10 no longer describes
+this box's current state.
+
+**2026-09-03, correction — the exclusion is worth keeping, but it did not cause the
+speed-up, and the entry above overstates its case.** Pulled every `started in` line from
+`D:\warden\logs\ollama-server.log`: **42 load events** between 2026-08-29 and 2026-09-03.
+The distribution kills the causal claim.
+
+| window | load time |
+|---|---|
+| 2026-08-29 → 08-30 (13 events) | 1.3 – 22.9 s |
+| **2026-09-01 20:48 – 21:00 (4 events)** | **179.9 – 190.0 s** |
+| 2026-09-01 21:41 – 22:53 (6 events) | 13.3 – 14.6 s — **no exclusion yet** |
+| 2026-09-03 17:00, post-exclusion | 16.3 s |
+
+The 190 s was **one twelve-minute window** that resolved on its own two days before the
+exclusion existed, and 16.3 s after the fix is indistinguishable from 13.8 s before it. So
+"190 s → 16 s because of the exclusion" is not supported; loads had already returned to ~14 s
+by 21:41 on 09-01 with nothing changed that affects load speed. The most economical
+explanation is Defender's cached scan verdict being invalidated — a signature update does
+this — forcing one full scan of the 4.87 GB blob, after which the verdict is re-cached.
+
+**Keep the exclusion anyway, for the reason that actually applies to Phase 3.** It does not
+make steady-state loads faster; it removes the re-scan penalty entirely, and the load most
+exposed to that penalty is the **first** load of a **newly pulled** file — which is exactly
+`qwen2.5vl:7b`. So the exclusion is worth having *before* the Phase 3 pull rather than as a
+fix for slowness already observed.
+
+Two things this corrects elsewhere: §7's Defender bullet and the `gpu-box` skill both said
+"every read of a ~5 GB blob gets scanned", which the 42-event distribution refutes — the
+skill has been rewritten to say a slow load clears itself and should not be chased. And the
+methodological point is the same one this project keeps relearning: **a single measurement
+is not a distribution.** The 190 s figure was real, reproducible within its window, and
+still not a property of the box.
+
+**2026-09-04 — Phase 3's measurement expired the interlock decision, exactly as flagged.**
+The vision workload is declared live as `ollama:qwen2.5vl-32k:7b`, `cost_mib` **8375**,
+measured with `measure_footprints.py` on a quiet card with `clonin-frontdoor` gated — the
+procedure §5 asked for, followed. The number is the problem:
+
+| | MiB |
+|---|---|
+| measured `cost_mib` | 8,375 |
+| admission need, ×1.10 | 9,213 |
+| book on an empty card | 12,489 — **fits** |
+| book with clonin resident (3,726) | 8,763 — **does not fit, by 450** |
+
+§3.4 estimated ~7,514 raw / ~8,265 after the factor, so the estimate was **861 MiB low —
+11%** — and the 53 MiB of headroom it claimed never existed. That estimate came from
+dividing ollama.com's rounded download string by 1048576 with the graph term deliberately
+omitted; the omission was defensible on one calibration point and is now falsified on a
+second. **Treat every remaining row of §3.4's table as similarly optimistic** — in
+particular `minicpm-v:8b`, the declared fallback, whose ~6,755/~7,741 figures were built
+the same way.
+
+The consequence is behavioural, not arithmetic: an `interactive` browsing lease **evicts
+the public voice service**, every time it is loaded, rather than sitting beside it. The
+"no interlock" call in the entry above was explicitly made with an expiry date attached to
+this measurement, and the measurement has collected it.
+
+**Settled by the owner 2026-09-04: warn and ask, per run.** `browsin` checks for a clonin
+tenant before it acquires, names who would be displaced, and requires an explicit choice —
+`--evict` to proceed, `--wait` to queue behind the 120 s idle linger. It never evicts a
+public service silently. §1, §4.4 and §8 updated; this is now an implementation obligation
+for Phase 6's CLI, not a documentation note.
