@@ -22,13 +22,20 @@ Continue the `browsin` project in `~/Documents/claude/browser_use_local_model_GP
   is loopback-only), `browsin/proxy.py` (the logging reverse proxy that is the *only* way to
   see prompt size, since `history.usage` is zeros on this path), `browsin/fixture.py` (the
   canvas-nonce page that separates "a screenshot was sent" from "the model read it").
-- `tools/browse.py` is the demonstration path — same lease, same Chrome, same proxy:
+- **Phase 5's instrument exists (2026-09-05): `tools/test.py`.** One entry point: `run` (the
+  six-task table, N reps, graded against truth it fetches itself, every miss auto-DIAGNOSED
+  with the mechanism and the decisive screenshot), `one` (a one-off on the same path), `diagnose`
+  and `compare` (offline), `self-check` (41 controls, no card), `guide` (the loop). First
+  measured completion rate: **13/18 = 72%**, and the dominant wrong-answer mechanism is
+  identified (`had_then_lost`: a stray `input` scrolls row 1 off-screen, the model re-reads the
+  wrong row). `tools/browse.py` is now an alias of `test.py one`; it no longer attaches to a
+  running Chrome. Start with:
 
-      venv/bin/python -u tools/browse.py --url https://en.wikipedia.org/wiki/Main_Page \
-          --task "Find today's featured article and report its title."
+      venv/bin/python tools/test.py guide
 
-**Your job: Phase 5 — real tasks, externally verified.** (§5 defines it.) Then Phase 6 puts
-`browsin` on PATH with a config and a skill.
+**Your job: run THE LOOP in that guide.** Baseline, pick the top pattern from the ROLLUP, form
+the fix as an `--arms` arm, probe, measure with `compare`, land. The first arm to try is
+already named in the NEXT footer of every batch. Then Phase 6 puts `browsin` on PATH.
 
 **Phase 5's gate needs one thing Phase 4 turned up.** Element-reference resolution rate
 cannot be read from `history.errors()`: for `click` and `input`, a missing index returns
@@ -45,9 +52,11 @@ disappoints, shrinking the action registry or testing `flash_mode` is the first 
 a different model.
 
 **Live state as of handoff (re-verify, do not trust):**
-- warden `:8130` healthy. `foreign_mib` idles ~2200–2600 on a **quiet** card and sits at
-  ~2740 with a tenant resident — that is a CUDA context, not a leak. Only gate on it when
-  `tenants` is empty.
+- warden `:8130` healthy. `foreign_mib` idles ~2200–2600 on a **quiet** card with a **quiet
+  desktop**, sits at ~2740 with a tenant resident (a CUDA context), and sat flat at ~2805 on
+  2026-09-05 while somebody used the Windows desktop (Task Manager, Snipping Tools, Chrome,
+  Plex). None of those is a leak — a leak *climbs*. `card_preflight` now refuses only above a
+  4000 hard ceiling or on a rising trend; a flat excess is warned and allowed.
 - The owner's decisions, 2026-09-04: drive the **browser-use copy** profile
   (`~/.config/browseruse/profiles/chrome-default`, holds real cookies), **stop and ask**
   before displacing the clonin voice service, keep everything in `PLAN.md` rather than a

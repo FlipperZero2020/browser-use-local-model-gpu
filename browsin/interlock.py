@@ -1,8 +1,9 @@
 """Refuse to take the card when taking it would cut somebody else off, or when the
 numbers describing it cannot be trusted.
 
-Lives in its own module because both the gate and `tools/browse.py` need it, and
-`tools/phase4_gate.py` cannot be imported for it: that module sets `TMPDIR`,
+Lives in its own module because `tools/test.py`, `tools/phase4_gate.py` and (through
+`test.py`) `tools/browse.py` all need it, and `tools/phase4_gate.py` cannot be imported for
+it: that module sets `TMPDIR`,
 `tempfile.tempdir` and `BROWSER_USE_CONFIG_DIR` and creates a run directory *at import*,
 because those have to happen before `browser_use` is imported. Importing it for one
 function would silently redirect the caller's temp files into a stray run directory.
@@ -15,9 +16,16 @@ class Interlock(RuntimeError):
 	"""The card is not free, and taking it would cut somebody else off."""
 
 
-#: `foreign_mib` idles here on a quiet card (PLAN.md §7). Above it, with no tenants, means a
-#: load leaked in flight and shows in neither `/api/ps` nor warden's tenants.
+#: `foreign_mib` idles here on a QUIET card with a QUIET desktop (PLAN.md §7, measured
+#: 2026-09-01). Above it with no tenants is a reason to look closer, not — by itself — to refuse.
 FOREIGN_BASELINE_MAX = 2700
+#: Nothing the desktop does reaches this; a leaked in-flight model load (5-8 GB) does.
+FOREIGN_HARD_MAX = 4000
+#: The mechanism this rule exists to catch is a load *climbing* into VRAM while appearing in
+#: neither `/api/ps` nor warden's tenants (measured 2026-09-01: 2,230 → 7,336). It climbs by
+#: hundreds of MiB per sample. A busy desktop is flat.
+FOREIGN_RISE_MIB = 150
+FOREIGN_TREND_WAIT_S = 15
 
 
 async def card_preflight(*, evict: bool, verbose: bool = True) -> dict:
@@ -57,10 +65,37 @@ async def card_preflight(*, evict: bool, verbose: bool = True) -> dict:
 			      f'tenant(s) resident, which inflates it above the idle baseline)',
 			      flush=True)
 	elif (v.get('foreign_mib') or 0) > FOREIGN_BASELINE_MAX:
-		problems.append(
-			f'foreign_mib {v.get("foreign_mib")} > {FOREIGN_BASELINE_MAX} on a card with NO '
-			f'tenants: a load leaked in flight and appears in neither /api/ps nor warden\'s '
-			f'tenants. Wait for baseline — no VRAM number is trustworthy until it settles.')
+		# Above the idle baseline with no tenants. Measured 2026-09-05, and it cost every run
+		# of an evening before it was understood: `foreign_mib` sat FLAT at 2805 for 25 minutes
+		# while nvidia-smi on the box read 2534 MiB total — inside the baseline — with no
+		# `llama-server` process anywhere, and the GPU contexts belonging to Task Manager,
+		# four Snipping Tools, 17 Chrome processes, Plex and Settings: somebody was using the
+		# desktop. That memory is exactly what warden calls "foreign" and cannot reclaim, and
+		# it is not the leaked load this rule is written for. A leak CLIMBS. So: refuse on a
+		# hard ceiling the desktop cannot reach, refuse on a rising trend, and otherwise warn
+		# with the numbers and proceed — the number is recorded in the preflight line either
+		# way, so a reader of the log can judge it.
+		import asyncio
+		first = v.get('foreign_mib') or 0
+		if first > FOREIGN_HARD_MAX:
+			problems.append(
+				f'foreign_mib {first} > {FOREIGN_HARD_MAX} on a card with NO tenants: that is a '
+				f'model-sized amount of VRAM nobody is accounting for — a load leaked in flight, '
+				f'visible in neither /api/ps nor warden\'s tenants. Wait for it to self-reap.')
+		else:
+			await asyncio.sleep(FOREIGN_TREND_WAIT_S)
+			second = ((await probe()).get('vram') or {}).get('foreign_mib') or first
+			if second - first > FOREIGN_RISE_MIB:
+				problems.append(
+					f'foreign_mib is CLIMBING: {first} → {second} in {FOREIGN_TREND_WAIT_S} s with '
+					f'NO tenants — a load leaking in flight. Wait for baseline; no VRAM number is '
+					f'trustworthy until it settles.')
+			elif verbose:
+				print(f'   WARNING foreign_mib {first} is above the {FOREIGN_BASELINE_MAX} idle baseline '
+				      f'but flat ({first} → {second} over {FOREIGN_TREND_WAIT_S} s) and under the '
+				      f'{FOREIGN_HARD_MAX} hard ceiling: consistent with a busy desktop on the box, '
+				      f'not a leaked load. Proceeding; the excess is memory warden cannot reclaim.',
+				      flush=True)
 	if v.get('ghost_mib'):
 		problems.append(f'ghost_mib {v.get("ghost_mib")}: the book is already under-admitting')
 	if problems:

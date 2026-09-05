@@ -1,0 +1,226 @@
+CORPUS: Examined: (a) all 19 task output files in /tmp/claude-1000/-home-tom-Documents-claude-browser-use-local-model-GPU/ea7bd3e4-2602-4729-95c7-2f42cd74debb/tasks/ (17 non-empty, read in full; beg6lorzh.output and w6mwagsss.output are 0 bytes and could not be examined), covering ~50 agent runs between 00:51 and 03:44 on 2026-09-05 including the three phase5 gate batches (025207: 6 runs, 025919: 18 runs, 031727: 8 runs) and the SIGTERM-killed batch 034044; (b) every run dir under /home/tom/Documents/claude/browser_use_local_model_GPU/runs/ that has a conversation dir, parsed mechanically with Python: 64 runs / 354 step files = 16 browse-*, 5 browse-test-*, 35 phase5-*/<task>-repN, plus 8 phase4-* (gate/control runs against a local fixture on 2026-09-04; examined, but excluded from occurrence counts because several were deliberately degraded controls such as no-vision/blank-canvas); (c) all proxy.jsonl files: 391 LLM-call records, 389 with eval_count (median 160, p90 204, max 17,328; done_reason 'length' x2, 'stop' x387); (d) results.json for phase5-025207/025919/031727 (32 graded rows, 1 RACY); (e) PLAN.md 2026-09-05 sections, tools/phase5_gate.py grade(), browsin/agent.py prompt additions, tools/browse.py attach path. Not examinable: 7 run dirs with no conversation and no or empty proxy.jsonl (browse-20260905-003337, -003518, -004232, phase5-20260905-025036, -025045, -025158, -025905) whose stdout was not preserved; 14 individual steps across 10 runs whose model output failed schema validation and therefore have no conversation file (only the printed pre-retry text survives in the task outputs); screenshots were not opened. Every count below is over the 56 non-phase4 runs unless stated.
+
+=== 21 PATTERNS ===
+
+## had_then_lost_via_viewport_jump  [wrong-answer]  x5
+DESC: The model reads the correct answer into memory, then takes a stray `input` action typing that answer into a non-text element. browser-use scrolls the target into view, so the next screenshot shows a different part of the page (on Hacker News: the bottom half, page_info goes 0.0 -> 0.6 pages above). The model re-reads 'the top story' from the new viewport and overwrites memory with the first story now visible, then calls done(success=True) with it. Every one of the 5 wrong hn-top-story answers in the corpus follows exactly this sequence, and 3 of 5 produced the same wrong title ('The Highest Point in the Netherlands', the first story visible after the jump). Fluent, schema-valid, indistinguishable from a correct run without ground truth.
+RULE: Let Q(s) = set of quoted literals (regex "'([^']{12,}?)'" or "\"([^\"]{12,}?)\"") in history[s].model_output.memory. Fire when there exist steps i<j with: (1) history[i].model_output.action contains an `input` action whose params.text is a substring of memory[i] (answer retyped); (2) history[i].result[k].extracted_content contains "differs from typed text" OR (conversation-file variant) <page_info> 'pages above' differs by >=0.3 between step i and i+1 while no `scroll` action was taken; (3) Q(j) is non-empty and disjoint from Q(i) with state.url unchanged between i and j (same page, no navigation); (4) the final done.text contains a literal from Q(j) and none from Q(i). With ground truth (phase5_gate.grade): had_then_lost = expected in some memory and absent from final answer — the existing detector. Without ground truth, (1)-(4) is the proxy.
+FIELDS: ['model_output.memory', 'model_output.action[].input.text', 'result[].extracted_content', 'state.url', 'done.text', 'conversation <page_info> pages above (not in BrowserStateHistory)']
+FP-RISK: Single-quote literal extraction is confused by apostrophes in memory text ("the ship's hull" produced spurious literal changes in every wiki-scroll-deep run); require literals that also appear in the done text or in an `input.text`, or use the task's expected string when available. A genuine page reorder (HN front page moves) can also change the literal legitimately; the gate's RACY re-fetch handles that.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-024329 steps 1->2 (memory 'Actively exploited sandbox RCE...' -> 'Portal by Spotify...'; task output bp3jc7nkl.output)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/hn-top-story-rep1 steps 3->4 ('Actively exploited...' -> 'Artificial Analysis Intelligence Index v4.2'; page_info 0.0->0.6 above)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-031727/hn-top-story-rep1 steps 2->3 (-> 'The Highest Point in the Netherlands')
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-031727/hn-top-story-rep2 steps 2->5 (-> 'Artificial Analysis Intelligence Index v4.2'; graded RACY but the overwrite is visible)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-031727/hn-top-story-rep4 steps 2->3 ('AI handles incidents...' -> 'The Highest Point in the Netherlands')
+  - /tmp/claude-1000/-home-tom-Documents-claude-browser-use-local-model-GPU/ea7bd3e4-2602-4729-95c7-2f42cd74debb/tasks/b9nk1x89z.output lines 64, 200 (HAD-THEN-LOST flags)
+
+## answer_retyped_into_input  [wasted-steps]  x83
+DESC: After the answer is already in memory, the model 'reports' it by typing it into an arbitrary interactive element (nav links, 'More', 'show', citation markers, ISBN text) instead of calling done, and repeats this on consecutive steps with different or identical indices until max_steps forces done. Harmless to correctness on Wikipedia, but it is the precondition for had_then_lost (viewport jump) and for input_side_effect navigation. 77 of the 83 occurrences carry browser-use's own warning that the target was not a text field.
+RULE: For step s with an `input` action: norm(action.input.text) is a substring of norm(model_output.memory of step s or s-1), where norm collapses whitespace and lowercases; AND action.input.text is not a query the task asked to type (task text does not contain it). Strengthen with result[].extracted_content matching r"actual value '.*' differs from typed text" (typing into a non-editable element). Count steps; a run flags when >=1.
+FIELDS: ['model_output.action[].input.text', 'model_output.memory', 'result[].extracted_content', 'task text']
+FP-RISK: Low. A legitimate form-fill whose text coincidentally appears in memory (e.g. memory says "will search for 'Ada Lovelace'" then input 'Ada Lovelace') matches the substring test; exclude inputs whose text appears in the task prompt. 23 distinct runs, 83 steps.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-013709 steps 1-7 (7x 'Gloria Steinem (pictured) dies at the age of 92'; bqn12gfgu.output TRIAL 2)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-013824 steps 1-4,6,7
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/hn-15th-story-rep1 steps 2-7 (6x index 888 'Pointing at the error...')
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/wiki-scroll-deep-rep2 steps 8-10 ('Halomonas titanicae' x3)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-034044/wiki-scroll-deep-rep1 steps 9-11
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-024432 step 1 (b6sejmxlf.output)
+
+## read_only_task_violation  [wasted-steps]  x42
+DESC: Task text says 'Do not click any links and do not type into any fields' and the model clicks or types anyway. Typing (39 steps in 9 runs) is the retype habit above; clicking (3 steps) navigated away from the page in every case (Freddie Mercury article, a CBS template page, an HN from?site= listing), and in browse-20260905-004955 the answer was then read from the wrong page.
+RULE: If task text contains 'do not type' (case-insensitive): every step whose action list contains `input` is a violation. If task text contains 'do not click': every `click` is a violation; additionally flag click_drift when state.url of step s+1 != state.url of step s after such a click. Equivalent to phase5_gate's wasted_actions but split by verb and with the URL-change escalation.
+FIELDS: ['task text', 'model_output.action[] names', 'state.url']
+FP-RISK: None for the verb test when the prompt literally contains the prohibition; do not apply to tasks that ask for typing (wiki-search-box). URL fragments (#cite_note) count as a URL change; compare URLs without the fragment if only navigations matter.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-013824 step 5 click idx 1674 -> https://en.wikipedia.org/wiki/Freddie_Mercury (bqn12gfgu.output TRIAL 3)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-004955 step 1 click idx 1418 -> Template:Children's_programming_on_CBS_in_the_1970s (bal1kxlzw.output)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/hn-15th-story-rep3 step 2 click idx 445 -> news.ycombinator.com/from?site=artificialanalysis.ai (then answered a wrong title; bth95z4cb.output line 1319-1381)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025207/hn-15th-story-rep1 steps 2-7 (6 inputs in a 'do not type' task)
+
+## input_side_effect_navigation  [wasted-steps]  x7
+DESC: A stray `input` into a non-text element acts as a click: it opens Wikipedia's media viewer, jumps to a #cite_note anchor, or follows an HN 'from?site=' link. The page the model sees next is different from the one it thinks it is on. In 031727/hn-top-story-rep1 this is the step that set up the answer overwrite.
+RULE: For consecutive steps s, s+1: history[s].model_output.action == [input] only, and state.url(s+1) != state.url(s). Report the new URL. (Fragment-only changes such as '#cite_note-...' are included because they also move the viewport.)
+FIELDS: ['model_output.action[]', 'state.url']
+FP-RISK: A legitimate search-box input that auto-submits on Enter would also change the URL; exclude when the task asked for that input.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-003756 step 3 -> Main_Page#/media/File:Freddie_Merc...; step 5 -> #/media/File:Callam_Offic...
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-023934 step 2 -> Gloria_Steinem#cite_note-cnn-1 (bsbf3ht1v.output)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-031727/hn-top-story-rep1 step 3 -> news.ycombinator.com/from?site=hanazo.no
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/wiki-scroll-deep-rep1 step 9 -> Wreck_of_the_Titanic#cite_note-FOOTNOTEC...
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-034044/wiki-scroll-deep-rep1 step 11
+
+## inverted_scroll_direction  [stall]  x6
+DESC: Model emits scroll(down=False) while its own memory/next_goal say 'scroll down'; the tool reports 'Scrolled up 742px' at the very top of the page (a no-op). 6 of 7 scrolls in the one run before the scroll-direction paragraph was added to DONE_PROMPTLY_MESSAGE; 0 of 60+ scrolls in every run after it.
+RULE: Step s has a `scroll` action with params.down == False AND norm(memory + next_goal + evaluation_previous_goal) contains 'down' and does not contain 'up'. Corroborate with result[].extracted_content matching 'Scrolled up' and/or the conversation <page_info> showing '0.0 pages above' at that step (scroll up from the top is a guaranteed no-op).
+FIELDS: ['model_output.action[].scroll.down', 'model_output.memory', 'model_output.next_goal', 'result[].extracted_content']
+FP-RISK: Memory that says 'scroll back up' contains 'up' and is excluded; memory saying 'went down too far, scrolling up' is excluded correctly. A model that says nothing directional is not caught. Only one run exhibits it; treat as a regression check for the prompt fix rather than an active failure mode.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-021746 steps 1-6 (memory 'Scrolled down to find the Wreck section', action down=False, tool 'Scrolled up 742px'; b0blwp542.output lines 13-59)
+
+## scroll_step_too_small_for_budget  [wasted-steps]  x8
+DESC: Every scroll uses the default one viewport (742px; `pages` absent or 1.0) even though the prompt now recommends 3-5 pages for a far target. wiki-scroll-deep (target ~12.8k px) needs 8+ scrolls and consumed 11-12 of 12 steps every time it passed; at max_steps 8-12 on Sinking_of_the_Titanic it never arrived. The model never emitted pages > 1.0 in any run.
+RULE: Count consecutive steps whose only action is `scroll` with params.pages in (None, 1.0) and same params.down. Fire when the run length >= 6; escalate to stall when the run reaches the final step and done.success is False or done.text matches the not-found regex.
+FIELDS: ['model_output.action[].scroll.pages', 'model_output.action[].scroll.down', 'metadata.step_number', 'done.success', 'done.text']
+FP-RISK: Repeated identical scroll down is legitimate on a long page and is exactly how the passing runs reached the target; this rule measures efficiency, not error. Do not count it against correctness. Whether a larger `pages` value would have been safe is untested (PLAN.md notes this).
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-023213 steps 1-11 (11 x scroll down 742px, done(success=False) 'not explicitly mentioned in the current section'; bf4bbdm16.output)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-test-20260905-022029 steps 1-9 (9 scrolls, target absent from that article anyway; bfilrauqm.output)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/wiki-scroll-deep-rep1 steps 1-8 then 3 retypes, forced done at 12/12
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/wiki-scroll-deep-rep3 steps 1-8
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-034044/wiki-scroll-deep-rep1 steps 1-8
+
+## stale_narrative_after_navigation  [stall]  x9
+DESC: The URL changed (the click worked, the article loaded) but the next step's evaluation and memory are byte-identical to the previous step's: the model did not register the navigation. It then keeps 'clicking the Search button' on the article page (an inert span, or another Search button that navigates elsewhere) and at forced-done either reads the answer by luck or reports 'results not yet loaded'. This is the mechanism behind every wiki-search-box failure and the 14,14 step bimodality.
+RULE: For consecutive steps s-1, s: state.url(s) != state.url(s-1) (ignore fragment) AND norm(memory[s]) == norm(memory[s-1]) AND norm(evaluation_previous_goal[s]) == norm(evaluation_previous_goal[s-1]). Escalate when the following actions repeat a `click` with the same index >= 3 times, or when result[].extracted_content is 'Clicked span' / the click target text is not what memory says it is clicking.
+FIELDS: ['state.url', 'model_output.memory', 'model_output.evaluation_previous_goal', 'model_output.action[].click.index', 'result[].extracted_content']
+FP-RISK: A URL change caused by a fragment/anchor with genuinely nothing new to say could repeat memory legitimately; strip fragments before comparing. Memory identical across a real navigation is otherwise almost never correct behaviour.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-024139 steps 2->3 (Main_Page -> Ada_Lovelace) then click idx 5028 'Clicked span' x5, steps 3-7 (b8qkqkixu.output)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025207/wiki-search-box-rep1 steps 3-7 click idx 5297 x5 (beailbdbu.output lines 161-207)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-031727/wiki-search-box-rep2 steps 5 (-> Ada_Lovelace_Award) and 7 (-> w/index.php?search=), 12 clicks, done(success=False) 'result page has not yet loaded' at 14/14
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-034044/wiki-search-box-rep1 steps 3, 4
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-013824 step 6 (Main_Page -> Freddie_Mercury, memory unchanged)
+
+## stale_element_index_retry  [wasted-steps]  x8
+DESC: The action targets an element index that no longer exists after the page changed; browser-use returns 'Element index N not available - page may have changed' and the model re-issues the identical index on the next step(s) instead of re-reading the state.
+RULE: result[].error or result[].extracted_content matches r'Element index (\d+) not available' at step s, and step s+1 contains an action with the same index (click.index or input.index). Count consecutive repeats; fire at >= 2.
+FIELDS: ['result[].error', 'result[].extracted_content', 'model_output.action[].click.index', 'model_output.action[].input.index']
+FP-RISK: A single occurrence is normal after a navigation (indices are re-assigned every step); only the repeat is a defect. Phase4 control runs show the same 'index 1' loop but under deliberately degraded inputs, excluded here.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/hn-top-story-rep3 steps 2-5 (input idx 35 x4, all 'Element index 35 not available'; bth95z4cb.output lines 1256-1282)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/wiki-scroll-deep-rep1 steps 10-11 (idx 100 x2)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025207/hn-top-story-rep1 step 2 (idx 38, single)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/hn-15th-story-rep3 step 3 (idx 15, single)
+
+## typed_but_never_submitted  [stall]  x2
+DESC: The model types the search query correctly, then never submits it: it either waits repeatedly for results that cannot arrive (12 consecutive `wait`s) or misuses `search_page` (find-in-page) as if it were the site search, getting '0 matches found' six times. URL never changes; run ends at max_steps with an honest 'not yet returned results'.
+RULE: There is a step i with an `input` action whose text appears in the task prompt (a requested query); for all later steps the action set contains no `click`, `send_keys`, or `search` action; state.url is constant from i to the end. Sub-signals: >= 3 consecutive `wait` actions; or >= 3 consecutive `search_page` actions with result[].extracted_content containing '0 matches found'.
+FIELDS: ['model_output.action[] names', 'model_output.action[].input.text', 'task text', 'state.url', 'result[].extracted_content']
+FP-RISK: A site that auto-navigates on typing would change the URL and not match. `wait` after a real submit is legitimate; the rule requires no submit verb at all.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-031727/wiki-search-box-rep1 steps 2-13 (12 x wait 5s; b9nk1x89z.output line 22; results.json actions ['input','wait'x12,'done'])
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/wiki-search-box-rep2 steps 2-7 (6 x search_page 'Ada Lovelace': 0 matches; bth95z4cb.output lines 630-687)
+
+## empty_action_declares_completion  [wasted-steps]  x11
+DESC: The model writes 'The task is complete / no further actions are needed' in next_goal and returns an empty action list instead of calling done. browser-use retries once, then inserts a noop and counts a failure ('Result failed k/6'); the step's conversation file is never written. It burned steps 1-2 entirely in phase5-025919/hn-top-story-rep1 and steps 3-4 in hn-15th-story-rep2. Also fires at step 1 on a blank HN page ('there is no content to report. The task is complete.').
+RULE: Any of: (a) history[s].result[].error startswith 'Invalid model output format' (noop inserted); (b) history[s].model_output is None or model_output.action is empty; (c) the agent_history text of a later step contains 'Agent failed to output in the right format.'; (d) proxy.jsonl has more records than history steps (each retry is an extra call) — 9 of 56 runs; (e) conversation dir is missing step numbers in 1..N — 8 of 56 runs. Strong co-signal: next_goal or evaluation_previous_goal contains 'task is complete' or 'no further action' while no `done` action is present.
+FIELDS: ['result[].error', 'model_output (None) / model_output.action (empty)', 'model_output.next_goal', 'proxy record count vs len(history)', 'conversation file step numbering']
+FP-RISK: Rule (d) also counts the two runaway generations (each a separate proxy record that produced no step); rule (e) also counts steps lost to malformed JSON. Separate by eval_count: retries have eval_count ~150-200 and done_reason 'stop'.
+EVIDENCE:
+  - /tmp/claude-1000/-home-tom-Documents-claude-browser-use-local-model-GPU/ea7bd3e4-2602-4729-95c7-2f42cd74debb/tasks/bth95z4cb.output lines 283-292 (025919/hn-top-story-rep1 step 2: 'No further actions needed as the task is complete' -> 'Model returned empty action' -> noop -> 'Result failed 2/6')
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/hn-top-story-rep1 (conversation files _3.._6 only; steps 1-2 missing)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/hn-15th-story-rep2 (steps 3-4 missing; bth95z4cb.output lines 783-797, 841-850)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-013709 step 8 and browse-20260905-024139 step 8 (retry succeeded: proxy 9 calls for 8 steps; bqn12gfgu.output line 115, b8qkqkixu.output line 74)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-031727/hn-top-story-rep2 (steps 1,3,4 missing)
+
+## blank_first_state_on_fresh_chrome  [infra]  x8
+DESC: With a freshly started Chrome, the first browser_state for news.ycombinator.com is captured before the page renders: '<page_stats>Page appears empty - consider waiting - 0 links, 0 interactive, 2 total elements', 'Interactive elements: empty page'. The model's reaction varies and is often destructive: scroll down (moves off the top before counting stories), declare the task impossible (empty action -> noop), or wait (correct). Never observed on Wikipedia in this corpus. Infra timing, not comprehension.
+RULE: Step 1 conversation file's <browser_state> contains 'Page appears empty' (or page_stats interactive count == 0). In the history object: history[0].model_output.memory or evaluation_previous_goal contains 'page is empty' / 'no content is visible' while state.url is the task URL; escalate if history[0].action is `scroll`, is empty, or history[0].result[].error startswith 'Invalid model output format'. Confirm it was real (not hallucinated) via the page_stats text or the step_1.png screenshot.
+FIELDS: ['conversation <browser_state><page_stats>', 'model_output.memory', 'model_output.evaluation_previous_goal', 'model_output.action[]', 'result[].error', 'state.url']
+FP-RISK: browser-use's 'Page appears empty' heuristic also fires on legitimately sparse pages (the phase4 fixture: 1 link, 9 elements), so require 0 interactive elements or check the screenshot. In phase5-031727/hn-top-story-rep3 the DOM said empty yet the model answered correctly from the screenshot, so the DOM snapshot and screenshot can disagree.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/hn-15th-story-rep1/conversation/*_1.txt (page_stats 'Page appears empty... 0 interactive'; model scrolled down)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/hn-15th-story-rep2 step 1 (model waited 3 s: correct reaction)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/hn-15th-story-rep3 step 1
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025207/hn-15th-story-rep1 step 1
+  - /tmp/claude-1000/-home-tom-Documents-claude-browser-use-local-model-GPU/ea7bd3e4-2602-4729-95c7-2f42cd74debb/tasks/beailbdbu.output lines 225-233 (025207/hn-top-story-rep1 step 1: 'The page is empty' -> empty action x2 -> noop)
+  - /tmp/claude-1000/-home-tom-Documents-claude-browser-use-local-model-GPU/ea7bd3e4-2602-4729-95c7-2f42cd74debb/tasks/bth95z4cb.output lines 225-233 and 1194-1203 (025919 hn-top-story rep1, rep3 step 1)
+
+## done_only_when_forced_at_max_steps  [wasted-steps]  x30
+DESC: After taking any non-done action the model almost never calls done voluntarily; it keeps acting until browser-use's last-step message forces a done. 30 of the 56 runs ended at exactly step == max_steps; only 7 multi-step runs finished early. Consequence: every multi-step task costs its full budget regardless of when the answer was found (the answer is typically in memory 3-6 steps before the forced done), and raising max_steps does not convert failures into successes (14,14 for the stuck wiki-search-box runs).
+RULE: history[-1].model_output.action contains `done` AND history[-1].metadata.step_number == max_steps (max_steps from the run config or from the conversation <step_info> 'maximum:N'). Report steps_after_answer = (final step) - (first step whose memory contains a literal that also appears in done.text). Runs with len(history)==1 are excluded (immediate done is the desired behaviour and happened in every wiki-itn-lead and wiki-absent-section run).
+FIELDS: ['metadata.step_number', 'max_steps', 'model_output.action[] (done)', 'model_output.memory', 'done.text']
+FP-RISK: A task that genuinely needs every step (wiki-scroll-deep at max 12) ends at max_steps legitimately; use steps_after_answer > 0 to separate waste from necessity. Voluntary done after actions does occur (7 runs), so this is a strong tendency, not a hard rule.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/hn-top-story-rep3 (correct answer in memory at step 2, forced done at 6/6)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/wiki-scroll-deep-rep1 (answer at step 9, forced done 12/12)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-013709 and browse-20260905-013824 (answer at step 1, forced done 8/8; bqn12gfgu.output)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-031727/wiki-search-box-rep1 and rep2 (14/14)
+  - /tmp/claude-1000/-home-tom-Documents-claude-browser-use-local-model-GPU/ea7bd3e4-2602-4729-95c7-2f42cd74debb/tasks/*.output: 52 'Step budget warning' lines
+
+## honest_not_found  [honest-failure]  x12
+DESC: The GOOD failure: the run ends (usually at forced done) with success=False and a text that is a status report or an explicit admission ('not visible yet', 'has not yet returned results', 'does not exist on this page'), with no fabricated answer. Includes all 5 wiki-absent-section passes (1 step each) and 7 stuck runs. This is the outcome to preserve when tightening prompts; it must be separated from confident nonsense, which never carries these markers.
+RULE: Final `done` present AND (done.success is False OR done.success is None) AND done.text matches ABSENT_OK (phase5_gate: does not exist|no such|not exist|could not find|not found|there is no|no section|no box) or the progress-narrative regex (not yet|will continue|expected to load|has not (been|returned)|is still|still ongoing|has been entered|has been initiated|not visible|not explicitly mentioned|cannot be completed) AND done.text contains no quoted literal >= 12 chars that is absent from the task prompt (i.e. no candidate answer). For absent tasks additionally require none of the task's forbid strings.
+FIELDS: ['done.success', 'done.text', 'task text', 'task forbid list']
+FP-RISK: One run (phase5-025207/wiki-search-box-rep1) produced a narrative done with success=True that nevertheless ended '...The year Ada Lovelace was born is 1815' and was correct; the 'no candidate literal' clause keeps it out of this bucket. The markers are English-phrase heuristics and will miss paraphrases.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-021746 step 8: done(success=False) 'The Wreck section ... is not visible yet. I will continue scrolling' (b0blwp542.output)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-test-20260905-022029 step 10 (bfilrauqm.output)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-023213 step 12 (bf4bbdm16.output)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/wiki-search-box-rep2 and rep3 step 8; phase5-20260905-031727/wiki-search-box-rep1 and rep2 step 14
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-024517 step 1 and phase5-*/wiki-absent-section-rep* step 1: 'The Weather forecast section does not exist on this page.' (b2nknmz3s.output)
+
+## success_flag_is_noise  [infra]  x6
+DESC: done.success does not track correctness in either direction: 3 of 5 correct 'does not exist' answers were flagged success=False, while all 3 had_then_lost wrong answers in 031727 were success=True, and many correct runs omit the field (None). PLAN.md §5 already forbids grading on it; this records the measured basis for that rule.
+RULE: Given ground-truth correctness c: flag mismatch when (done.success is False and c) or (done.success is True and not c). Without ground truth: done.success is False while done.text matches ABSENT_OK in an absent-type task (the model treats a correct negative as failure).
+FIELDS: ['done.success', 'done.text', 'graded correctness']
+FP-RISK: None as a grading rule; it is only a hazard if anything downstream reads success.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-024517, phase5-20260905-025207/wiki-absent-section-rep1, phase5-20260905-025919/wiki-absent-section-rep3 (correct, success=False) vs 025919 rep1, rep2 (correct, success=True)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-031727/hn-top-story-rep1, rep2, rep4 (wrong, success=True)
+
+## runaway_generation  [stall]  x2
+DESC: Two consecutive LLM calls in one run generated 17,328 and 17,316 tokens (done_reason 'length', 426 s and 423 s each) — a multi-thousand-line malformed action list ('EOF while parsing an object at line 4260 ... "index": 1219'). The run took 884 s instead of ~50 s, the lease stayed held, and both outputs were discarded as parse failures. Occurred before num_predict=1024 was set; 2 of 389 logged generations.
+RULE: proxy.jsonl record with response.done_reason == 'length' OR response.eval_count >= 1024 OR elapsed_s > 60 (p99 for normal steps is ~10 s). Corroborate in the history: the corresponding step has result[].error containing 'Invalid JSON' / 'json_invalid' and no saved conversation file.
+FIELDS: ['proxy response.eval_count', 'proxy response.done_reason', 'proxy elapsed_s', 'result[].error']
+FP-RISK: With num_predict=1024 now set, done_reason 'length' at eval_count == 1024 is the expected signature of a truncated runaway; a legitimate step never exceeded 250 tokens in 389 samples, so the threshold has wide margin.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-031727/proxy.jsonl seq 39 (eval_count 17328, done_reason length, elapsed 426.1 s) and seq 40 (17316, 422.9 s) — hn-top-story-rep2, results.json seconds 884.2
+  - /tmp/claude-1000/-home-tom-Documents-claude-browser-use-local-model-GPU/ea7bd3e4-2602-4729-95c7-2f42cd74debb/tasks/b9nk1x89z.output lines 120-128 ('Invalid JSON: EOF while parsing an object at line 4260')
+
+## stale_tab_adopted_on_attach  [wrong-answer]  x2
+DESC: tools/browse.py's attach path never navigates to --url; it adopts whichever open tab's URL contains the same host. Two runs were driven on the previous run's leftover tab (an image-viewer overlay on Main_Page, then the unrelated article In_the_News) and produced fluent wrong answers ('In the News (1971-86)') because they answered from a wrong page. Infra bug, still open per PLAN.md; phase5_gate works around it by restarting Chrome per run.
+RULE: history[0].state.url (fragment and query stripped) != the task's start URL, in a run whose log says 'attached to chrome' rather than 'started chrome'. Also: task output line 'driving tab XXXX — <url>' where <url> != --url.
+FIELDS: ['state.url of step 1', 'task/run start URL', 'run log attach vs start line']
+FP-RISK: A task that legitimately starts by navigating elsewhere would differ at step 1 by design; compare against the URL the harness itself opened. Fragment-only differences (#cite_note) are not contamination.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-004955 step 1 url https://en.wikipedia.org/wiki/In_the_News (task asked for the Main Page 'In the news' box; answered 'In the News (1971–86)'; bal1kxlzw.output line 380-385 'attached to chrome', 'driving tab BDE03176 — https://en.wikipedia.org/wiki/In_the_News')
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-004347 step 1 url https://en.wikipedia.org/wiki/Main_Page#/media/File:Callam_Offic... (leftover media viewer from browse-20260905-003756)
+
+## self_navigation_to_guessed_url  [wrong-answer]  x1
+DESC: Facing an unexpected page, the model invented a URL from the task wording (navigate to https://en.wikipedia.org/wiki/In_the_news), landed on a real but unrelated article, and reported its title as the answer. One occurrence, triggered by the stale-tab contamination above.
+RULE: A `navigate` action whose params.url does not appear in the task prompt and was not the run's start URL, in a task that does not ask to navigate; escalate to wrong-answer when the final done.text's quoted literal equals (or is contained in) the new page title/URL slug.
+FIELDS: ['model_output.action[].navigate.url', 'task text', 'state.url', 'done.text']
+FP-RISK: Tasks that legitimately require navigation (phase4 'Go to http://127.0.0.1:.../second.html') must be excluded by the prompt test.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-004347 step 1 navigate -> https://en.wikipedia.org/wiki/In_the_news, then 5 retypes of 'In the News', done 'The title of the first article listed under In the News is In the News.'
+
+## phantom_files_to_display  [wasted-steps]  x3
+DESC: done is emitted with files_to_display ['results.md'] or ['todo.md'] although the agent never wrote a file; browser-use warns 'Agent wanted to display files but none were found'. Harmless to the answer, but a schema-echo artifact (the system prompt's examples mention todo.md/results files).
+RULE: done.files_to_display is a non-empty list AND no earlier step contains a write_file action (or result[].attachments is empty / the tool warning appears in result).
+FIELDS: ['model_output.action[].done.files_to_display', 'earlier actions', 'result[].attachments']
+FP-RISK: None if file writes are checked; empty lists ([]) are not flagged.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-test-20260905-023649 step 8 ['results.md'] (bvvt10wc2.output line 74-75)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025207/hn-15th-story-rep1 step 8 ['todo.md']
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025919/wiki-scroll-deep-rep2 step 11 ['results.md']
+
+## gate_batch_killed_by_sigterm  [infra]  x1
+DESC: A phase5 gate batch was SIGTERM'd by the caller after ~4 minutes (exit 144): 3 of 18 runs had completed, no results.json was written, and the batch's measurements were lost. The lease was returned correctly (browsin.lease.Interrupted). This is the CLAUDE.md warning about two-minute tool timeouts holding a lease, observed live.
+RULE: Run dir phase5-* has conversation dirs but no results.json; task output contains 'browsin.lease.Interrupted: SIGTERM' and '[exited with code 144]'. Per run: the last conversation step lacks a `done` action and the step count is < max_steps (e.g. wiki-search-box-rep1 stopped at 5/14).
+FIELDS: ['run dir contents (results.json presence)', 'task output exit code / traceback', 'final step action and step_number vs max_steps']
+FP-RISK: A batch still running also lacks results.json; check process state or the exit-code line first.
+EVIDENCE:
+  - /tmp/claude-1000/-home-tom-Documents-claude-browser-use-local-model-GPU/ea7bd3e4-2602-4729-95c7-2f42cd74debb/tasks/bvym5mwle.output lines 29-59
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-034044 (wiki-itn-lead-rep1 PASS, wiki-scroll-deep-rep1 PASS, wiki-search-box-rep1 truncated at step 5; no results.json)
+
+## racy_ground_truth_mid_run  [infra]  x1
+DESC: The Hacker News front page reordered between the pre-run and post-run ground-truth fetches (#1 changed from 'Actively exploited sandbox RCE...' to 'AI handles incidents...'), so the run could not be graded either way; the gate's race guard correctly excluded it. Note the same run also shows the viewport-jump overwrite, so it was likely wrong regardless.
+RULE: results.json row has racy == True (expected_after != expected and not correct). Equivalent: task.expect() before run != task.expect() after run.
+FIELDS: ['results.json racy / expected / expected_after']
+FP-RISK: A run that was correct against the pre-run truth is not marked racy even if the page moved; only incorrect-and-moved is excluded, which is the intended asymmetry.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-031727/results.json hn-top-story row 2 (racy: true, expected_after ['AI handles incidents, engineers lose touch with their systems']); b9nk1x89z.output line 135
+
+## startup_abort_no_trace  [infra]  x7
+DESC: Run dirs created (config/, tmp/) but the process never reached the first LLM call: no conversation dir, proxy.jsonl absent or empty. Their stdout was not captured in the task outputs, so the cause (preflight refusal, lease failure, script error while phase5_gate.py was being developed) cannot be determined from disk.
+RULE: Run dir exists with no */conversation directory AND (no proxy.jsonl OR proxy.jsonl has 0 lines) AND no results.json.
+FIELDS: ['run dir listing']
+FP-RISK: None; but the cause is unknown and should not be attributed to the model.
+EVIDENCE:
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-003337
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-003518 (proxy.jsonl 0 lines, screenshots dir empty)
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/browse-20260905-004232
+  - /home/tom/Documents/claude/browser_use_local_model_GPU/runs/phase5-20260905-025036, -025045, -025158, -025905

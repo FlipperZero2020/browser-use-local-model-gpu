@@ -1653,10 +1653,11 @@ First, a real tooling bug in `tools/browse.py`'s attach path: when Chrome is alr
 same host (browse.py:79-109). A prior run had left the dedicated Chrome profile sitting on an
 unrelated article (`en.wikipedia.org/wiki/In_the_News`, a real but wrong page — a 1970s CBS
 kids' news show, not the Main Page's "In the news" box), and every subsequent run silently
-drove that stale tab instead of the Main Page, with no error. **Not yet fixed** — the
-workaround used below was `systemctl --user stop browsin-chrome` before each run, forcing
-`B.start(args.url)` to launch fresh. A real fix belongs in `browse.py` (e.g. always navigate
-the chosen tab to `args.url` before handing off to the agent) and is still open.
+drove that stale tab instead of the Main Page, with no error. The workaround used below was
+`systemctl --user stop browsin-chrome` before each run, forcing `B.start(args.url)` to launch
+fresh. **Closed later the same day:** `tools/browse.py` is now a thin alias of
+`tools/test.py one`, which starts a fresh Chrome on `--url` for every run and never attaches;
+the attach path is gone from every entry point (see the consolidation entry below).
 
 Second, once that contamination was controlled for (fresh Chrome, verified on the real Main
 Page each time), the model's *reading* was measured correct **3 for 3**: every trial's
@@ -1767,10 +1768,11 @@ comprehension one.
 
 ### Phase 5 — the gate exists, and the first real number is 72%
 
-**2026-09-05 — `tools/phase5_gate.py` and `tools/test_phase5_grade_offline.py`.** Hand-running
+**2026-09-05 — `tools/phase5_gate.py` and `tools/test_phase5_grade_offline.py` — both folded
+into `tools/test.py` the same evening; see the consolidation entry below.** Hand-running
 tasks and reading logs is what produced the mistakes above; this replaces it. The gate runs a
-task table N times under **one lease**, restarts Chrome per run (working around the still-open
-attach bug), and grades every run against ground truth **the harness fetches itself** — the
+task table N times under **one lease**, restarts Chrome per run (the attach path was removed
+from every entry point later that day), and grades every run against ground truth **the harness fetches itself** — the
 ITN lead and the Hacker News front page are scraped immediately before each run, and the
 "stable" fixtures are re-verified live so a rotted one reports `FIXTURE-STALE` instead of
 being charged to the model. §5's rule is enforced structurally: `grade()` never reads
@@ -1837,3 +1839,112 @@ implementation dropped it** — the same class of silent divergence as §10's `m
 
 **Not yet re-measured with the cap in place.** The 72% and the probe both predate it, so the
 next batch is the before/after. Do not cite the cap as an improvement until that exists.
+
+### Consolidation — `tools/test.py` is the one way to test
+
+**2026-09-05, evening — four files became one entry point, and the diagnosis moved out of the
+chat and into the tool.** The owner's ask, verbatim in spirit: *one simple way of testing; keep
+what I was doing (read the log, find the mechanism, fix, measure); let it loop.* What was
+built, from a 64-run failure census and an independent design critique rather than from
+memory:
+
+- **`browsin/grade.py`** — runtime-derived truth (ITN lead, HN position, a phrase verified live
+  in an article), the six-task table, and `grade()` over a plain history dict with an
+  **outcome taxonomy** (`CORRECT / WRONG_ANSWER / NO_ANSWER / HONEST_MISS`, plus `RACY`,
+  `FIXTURE_STALE`, `TRUTH_UNAVAILABLE`, `SETUP_FAILED`, `ABORTED` excluded and counted). Pure,
+  stdlib-only; imports nothing from `browser_use`.
+- **`browsin/diagnose.py`** — the detectors, one per census pattern
+  (`docs/failure-census-2026-09-05.txt`; three labelled instrumentation), the per-run
+  DIAGNOSIS block (trace with viewport and has-answer columns, patterns with evidence, the
+  decisive screenshot and the frame before it, a TEMPLATE mechanism sentence), the
+  batch ROLLUP and a NEXT footer that names the top fixable pattern and the exact probe
+  command, Wilson intervals on every rate, Fisher exact for `compare`. Pure as well.
+- **`tools/test.py`** — `run` (table × reps, one lease, fresh Chrome per run, graded,
+  diagnosed, `results.jsonl` appended per run, `--resume`), `one` (same path, graded only with
+  `--expect-from`), `diagnose` and `compare` offline, `self-check` (95 controls, no card),
+  `guide`. Fixes are recorded **arms** (`--arms default,enforce-read-only | sysmsg:FILE |
+  set:KEY=JSON`), interleaved rep by rep; `compare` refuses a verdict under 6 per arm.
+  `tools/browse.py` is an alias of `test.py one` — it never attaches, so the morning's
+  stale-tab bug is closed by removing the path. `phase5_gate.py` and its offline test are
+  gone; `TESTING_PROMPT.md` points at `test.py guide` so the procedure exists once.
+
+**Reviewed adversarially before it was trusted.** Four read-only lenses (detector
+correctness, CLAUDE.md hard rules, docs-vs-code, edge cases) produced 57 findings; a skeptic
+per lens tried to refute each; 56 stood, all fixed. The two that mattered: **scraped truth
+kept HTML entities** — `Fermat&#x27;s` vs the `Fermat's` the model reads — so any Hacker News
+title with an apostrophe (2 of 30 that afternoon) would have graded a correct answer as
+confident nonsense, and the post-run refetch could not rescue it; and **`ChromeError` is a
+`RuntimeError`**, so a Chrome start failure escaped the per-run handler and aborted the whole
+batch instead of recording `SETUP_FAILED`. Also from the review: `--evict` now reaches the
+acquire (`may_evict`) and not only the preflight; the viewport reader parses browser-use's real
+`<page_info>N.N pages above` text (a draft matched "pixels above", which the library never
+emits); RACY is assigned only when a WRONG_ANSWER matched neither truth, a final matching the
+post-run truth is CORRECT, and an HONEST_MISS stays graded; arms are validated before any card
+time; exit codes follow CLAUDE.md's 0/1/2. Self-check grew from 41 to 95 so every detector has
+a positive that must fire and a negative that must stay silent.
+
+**The interlock refused every run for an evening, and it was wrong — the same class as
+2026-09-04's false refusal.** `foreign_mib` sat **flat at 2805** for 25 minutes on an empty
+card. `nvidia-smi` on the box read **2534 MiB**, inside the idle baseline; no `llama-server`
+process existed; the GPU contexts belonged to Task Manager, four Snipping Tools, 17 Chrome
+processes, Plex and Settings — somebody was using the Windows desktop, which is exactly the
+memory warden calls foreign and cannot reclaim. The leak the rule exists for *climbs*
+(2,230 → 7,336 on 09-01). `card_preflight` now refuses above a 4000 hard ceiling or on a
+rising 15 s trend, and otherwise warns with the numbers and proceeds. Right rule, wrong scope,
+again — and the fix is a trend, not a bigger constant.
+
+**First run through the finished tool** — `runs/test-run-20260905-045402`, the whole table
+once, arms `default` and `enforce-read-only` (inert on the two non-read-only tasks, skipped):
+
+```
+  wiki-itn-lead [default] 1/1 correct (80% CI 38%–100%)   avg 1.0 steps   0.0 wasted
+  wiki-itn-lead [enforce-read-only] 1/1 correct (80% CI 38%–100%)   avg 1.0 steps   0.0 wasted
+  wiki-scroll-deep [default] 1/1 correct (80% CI 38%–100%)   avg 10.0 steps   0.0 wasted
+  wiki-search-box [default] 0/1 correct (80% CI 0%–62%)   avg 14.0 steps   0.0 wasted   HONEST_MISS 1
+  hn-top-story [default] 0/1 correct (80% CI 0%–62%)   avg 6.0 steps   4.0 wasted   WRONG_ANSWER 1
+  hn-top-story [enforce-read-only] 1/1 correct (80% CI 38%–100%)   avg 2.0 steps   0.0 wasted
+  hn-15th-story [default] 1/1 correct (80% CI 38%–100%)   avg 8.0 steps   6.0 wasted
+  hn-15th-story [enforce-read-only] 1/1 correct (80% CI 38%–100%)   avg 2.0 steps   0.0 wasted
+  wiki-absent-section [default] 1/1 correct (80% CI 38%–100%)   avg 1.0 steps   0.0 wasted
+  wiki-absent-section [enforce-read-only] 1/1 correct (80% CI 38%–100%)   avg 1.0 steps   0.0 wasted
+  completion rate: 8/10 = 80%  (80% CI 60%–91%)
+  of the 2 miss(es), 0 had the correct answer in memory and dropped it
+ROLLUP — patterns per task (count of runs the pattern fired in / graded runs)
+  wiki-scroll-deep     stuck_narrative 1/1, steps_after_first_seen 1/1, scroll_step_too_small 1/1
+  wiki-search-box      repeated_action 1/1, stuck_narrative 1/1, done_only_when_forced 1/1, honest_miss 1/1
+  hn-top-story         blank_first_state 2/2, stray_input_on_read_only 1/2, url_changed_on_read_only 1/2, input_side_effect_navigation 1/2, repeated_action 1/2, done_only_when_forced 1/2
+  hn-15th-story        blank_first_state 2/2, stray_input_on_read_only 1/2, repeated_action 1/2, stuck_narrative 1/2, done_only_when_forced 1/2, steps_after_first_seen 1/2
+  adherence: scroll pages>1 used in 0/12 scrolls; scroll direction inverted in 0 runs
+  most frequent fixable pattern across the batch: blank_first_state (4 runs)
+```
+
+**What it says, and what it does not yet say.**
+
+1. **`enforce-read-only` — 4/4, 1–2 steps, zero wasted actions — against `default`'s 3/4 with
+   10 wasted actions and one WRONG_ANSWER on the same four tasks.** The honesty canary stayed
+   CORRECT under the arm. This is the hypothesis the census pointed at (every had-then-lost
+   begins with a stray `input`; remove the verb rather than ask nicely) with its first measured
+   data point. **One rep is a probe, not a claim** — the tool's own rule 5 wants 8 v 8 and a
+   Fisher p < 0.1 before a rate is asserted. That measurement is the next command:
+   `tools/test.py run --only hn-top-story --only hn-15th-story --reps 8 --arms default,enforce-read-only --label ab-enforce`.
+2. **`blank_first_state` on 4 of 4 Hacker News runs.** With a fresh Chrome, browser-use takes
+   its first snapshot before HN has rendered ("Page appears empty"); the model reacts with a
+   `scroll` every time, and that scroll is what moved row 1 off-screen before the first real
+   read in the default `hn-top-story` failure (trace: step 1 `scroll` from a blank TOP, step 2
+   already at BOTTOM). Never seen on Wikipedia. **This is a harness timing problem with a
+   harness-side fix** — wait for a non-empty DOM before handing the tab to the agent — and a
+   better next target than any prompt edit. Filed here as the next SETUP-side item.
+3. **`wiki-search-box` → HONEST_MISS**, the good miss: 11 repeated clicks on the same `<span>`
+   *after* the search had already navigated to the article, then an honest "the search term
+   has been entered" at 14/14. `stuck_narrative(n=13)` caught it; the stricter
+   `stale_narrative_after_navigation` did not, because the eval text differed at the navigation
+   step while the memory did not — loosen that detector to memory-only if this recurs.
+4. **Adherence counters now surface in the rollup:** `scroll pages>1 used in 0/12 scrolls`.
+   The scroll-pages instruction in `DONE_PROMPTLY_MESSAGE` has still never been followed once.
+5. **The num_predict cap is still not re-measured at 3 reps.** This run's 45 LLM calls showed 0
+   runaway, 0 slow, 0 aborted — consistent with the cap, not proof of it.
+
+Open, in order of value: the 8 v 8 for `enforce-read-only`; a DOM-ready wait before the agent
+starts (kills `blank_first_state` by construction); DOM-snapshot truth from the driven tab
+(closes the HN race instead of excluding it); the §5 thresholds (element-reference resolution,
+error-repair) are still not computed; Phase 6 (`bin/browsin`, config, skill) has not started.

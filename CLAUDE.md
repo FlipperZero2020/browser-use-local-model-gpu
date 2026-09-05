@@ -40,6 +40,10 @@ a failing gate then looks like a pass.
 # Offline. No card, no browser, no network — safe to run at any time, in the foreground.
 venv/bin/python tools/phase0_gate.py           # pins, zero-cloud env, the retired-kwarg guard
 venv/bin/python tools/test_lease_offline.py    # lease cancel/signal paths against a fake warden
+venv/bin/python tools/test.py self-check       # every scorer branch + every failure detector (41)
+venv/bin/python tools/test.py guide            # THE LOOP: run → diagnose → fix-as-arm → measure → land
+venv/bin/python tools/test.py diagnose runs/test-run-<ts>     # re-render diagnoses from saved history
+venv/bin/python tools/test.py compare runs/test-run-A runs/test-run-B
 
 # These hold the real card. Background or a long timeout, and ONE AT A TIME.
 venv/bin/python tools/phase2_gate.py                       # ~20 min, six lease checks
@@ -47,10 +51,13 @@ venv/bin/python tools/phase2_gate.py --only lost,sigint    # or: sigterm,assert,
 venv/bin/python tools/phase3_gate.py                       # vision workload: resident, right num_ctx
 venv/bin/python tools/phase4_gate.py                       # 14 checks, headed Chrome, canvas nonce
 venv/bin/python tools/phase4_gate.py --mode no-vision      # a CONTROL run — it is meant to FAIL
-venv/bin/python tools/phase5_gate.py --reps 3              # all six tasks, graded on fetched truth
-venv/bin/python tools/phase5_gate.py --only hn-top-story --reps 5
+venv/bin/python -u tools/test.py run --reps 3             # the six-task table, graded, DIAGNOSED (~17 min)
+venv/bin/python -u tools/test.py run --only hn-top-story --reps 4 --arms default,enforce-read-only
+venv/bin/python -u tools/test.py one --url URL --task "…" --expect-from hn:1   # one-off, graded
+venv/bin/python -u tools/test.py one --url URL --task "…"                      # one-off, UNGRADED
 
-# The demonstration path, not a gate. Same lease, same Chrome, same proxy.
+# The demonstration path is now an alias of `test.py one`: same lease, same fresh Chrome,
+# same proxy, same printed prompt-size block. It no longer attaches to a running Chrome.
 venv/bin/python -u tools/browse.py --url https://en.wikipedia.org/wiki/Main_Page \
     --task "Find today's featured article and report its title."
 
@@ -60,23 +67,34 @@ python3 tools/sweep_tmp.py --yes               # actually delete
 python3 tools/build_artifact.py                # regenerate PLAN.artifact.html
 ```
 
-Four things about running them:
+Six things about running them:
 
-- **`--evict` is the only way past the clonin interlock**, and it exists on `browse.py`,
-  `phase4_gate.py` and `phase5_gate.py`. Without it, a card held by the public voice service
+- **`--evict` is the only way past the clonin interlock**, and it exists on `test.py run|one`
+  (so on `browse.py`) and `phase4_gate.py`. Without it, a card held by the public voice service
   is an exit-2 refusal with a printed explanation, not a failure. Do not add it reflexively:
-  clonin's `idle_linger_s` is 120 s, so waiting is usually the right answer.
+  clonin's `idle_linger_s` is 120 s, so waiting is usually the right answer. Never in a loop.
+- **`foreign_mib` above 2700 with no tenants is a reason to look, not to refuse.** Measured
+  2026-09-05: it sat flat at 2805 for 25 minutes while `nvidia-smi` on the box read 2534 MiB,
+  no `llama-server` existed, and Task Manager, four Snipping Tools, 17 Chrome processes and
+  Plex held GPU contexts — somebody was using the desktop. The leak this rule exists for
+  *climbs* (2,230 → 7,336 on 2026-09-01). `card_preflight` now refuses above a 4000 hard
+  ceiling or on a rising 15 s trend, and otherwise warns with the numbers and proceeds.
 - **`phase4_gate.py --mode` runs controls** (`blank-canvas`, `no-vision`, `direct-url`,
   `no-proxy`, `signals`, `oversize`). Each one breaks the thing a specific check claims to
   test, so a control that passes everything means the gate cannot fail. They exit `0` when
   their target check fails, which is the point.
-- **`phase5_gate.py` grades against ground truth it fetches itself**, never against the
-  agent's own `done`/`success` flag. A `FIXTURE-STALE` line means the live page moved and the
-  expectation could not be built — that is not a model failure and must not be written up as
-  one.
-- **Every entry point writes `runs/<name>-<timestamp>/`** (gitignored): `proxy.jsonl`,
-  `conversation/`, and `evidence.json` or `results.json`. `proxy.jsonl` is the *only* place
-  prompt sizes exist — see `browsin/proxy.py` for why `history.usage` cannot answer.
+- **`test.py` grades against ground truth it fetches itself**, never against the agent's own
+  `done`/`success` flag (measured: that flag is noise in both directions). Outcomes are
+  `CORRECT / WRONG_ANSWER / NO_ANSWER / HONEST_MISS`; `FIXTURE_STALE`, `TRUTH_UNAVAILABLE`,
+  `RACY` (the page moved mid-run) and `SETUP_FAILED` are excluded from the rate and counted —
+  none of them is a model failure and none may be written up as one. Read the ROLLUP and the
+  DIAGNOSIS blocks before the rate; the rate alone is how an afternoon of wrong conclusions
+  happened on 2026-09-05.
+- **Every entry point writes `runs/<name>-<timestamp>/`** (gitignored). `test.py` writes
+  `results.jsonl` (one line per run, appended as each finishes — a killed batch keeps what it
+  measured and is `--resume`-able), per-run `history.json` + `DIAGNOSIS.txt`, `proxy.jsonl`,
+  `summary.txt`; the gates write `evidence.json`. `proxy.jsonl` is the *only* place prompt
+  sizes exist — see `browsin/proxy.py` for why `history.usage` cannot answer.
 
 ## Hard rules
 
@@ -131,14 +149,26 @@ paying the seconds, the `/tmp` leak and the telemetry singleton that import cost
 - **`fixture.py`** — the two-page local site whose nonce is painted into a `<canvas>` and
   exists nowhere in the DOM. It is what separates "a screenshot was sent" from "the model
   read it"; `assert_nonce_not_in_dom()` proves that property rather than assuming it.
-- **`interlock.py`** — `card_preflight()`, in its own module because both the gates and
-  `browse.py` need it and importing `phase4_gate` for it would silently redirect the caller's
-  temp files into a stray run directory.
+- **`interlock.py`** — `card_preflight()`, in its own module because `test.py` and the gates
+  need it and importing `phase4_gate` for it would silently redirect the caller's temp files
+  into a stray run directory.
+- **`grade.py`** — ground truth fetched at run time (`wikipedia_itn_lead`, `hn_story`,
+  `wikipedia_contains`), the `Task` table, and `grade()` over a plain history dict. **Pure,
+  stdlib-only, no `browser_use`**, so `test.py self-check` and `diagnose` can import it
+  without creating a run directory — four stray `runs/phase5-*` dirs on disk are why.
+- **`diagnose.py`** — the failure detectors (each corresponds to a pattern in the 64-run census
+  of 2026-09-05, `docs/failure-census-2026-09-05.txt`, except three labelled instrumentation),
+  the DIAGNOSIS renderer, the ROLLUP/NEXT footer, Wilson intervals and Fisher exact for
+  `compare`. Pure as well. The history shape it reads is documented in
+  `docs/browser-use-0.13.8-history-api.txt` — read that before touching a detector.
 
-**A new entry point must copy `tools/browse.py`'s header before it imports anything.**
-`TMPDIR`, `tempfile.tempdir` and `BROWSER_USE_CONFIG_DIR` are set to the run directory at the
-top of the file, because one of the four temp-directory families is created at browser-use's
-*import* time and `tempfile.gettempdir()` caches its answer the first time anything asks.
+**A new leasing entry point must do what `tools/test.py`'s `_enter_run_dir()` does before it
+imports anything from `browser_use`** — and only on the path that leases. `TMPDIR`,
+`tempfile.tempdir` and `BROWSER_USE_CONFIG_DIR` are set to the run directory, because one of
+the four temp-directory families is created at browser-use's *import* time and
+`tempfile.gettempdir()` caches its answer the first time anything asks. Offline paths must
+never pay that: `test.py self-check` asserts no run dir was created and `browser_use` was
+never imported.
 
 **`requirements.txt` pins with `==` on purpose. Never relax one to `>=`.** An unpinned
 `pip install browser-use` is the root cause of the divergence PLAN.md §10 exists to record;
