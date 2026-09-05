@@ -45,6 +45,50 @@ ALIASES: dict[str, str] = {
 	'skills': 'skills',
 }
 
+#: 2026-09-05 measurement: on a read-only task, `qwen2.5vl-32k:7b` correctly identifies the
+#: answer in step 1's own `memory` field every time (3/3 clean trials) — the vision read is
+#: not the problem. But left to its own defaults it then spends 6-7 more steps retyping that
+#: same answer into unrelated `input` fields (once drifting to a different article entirely
+#: via a stray `click`) before finally calling `done` — 3/3 correct in the end regardless,
+#: but 8 steps and ~70s instead of 1 step and ~10s. This one line fixed it: 3/3 trials dropped
+#: to exactly 1 step each, same or better answer. Not a model-capability gap; a missing
+#: instruction. See PLAN.md.
+#: 2026-09-05, same session — a second, independent bug found while testing a scroll-heavy
+#: task: the model's own `memory` field said "scrolled down" on 7 consecutive steps, but 6 of
+#: those 7 actually sent `scroll(down=False)` — scroll UP — confirmed by the tool's own printed
+#: effect ("Scrolled up 742px"), not a logging artifact. The schema is not ambiguous
+#: ("down=True=scroll down, down=False scroll up", default true) — this is the model's own
+#: semantic mix-up. One added paragraph fixed the direction: retested on the same task, 10 of
+#: 10 scrolls used the correct `down=True`. Merged into the same message as
+#: `DONE_PROMPTLY_MESSAGE` below rather than a second `extend_system_message` call, since only
+#: one is ever passed to `Agent`. See PLAN.md, 2026-09-05.
+DONE_PROMPTLY_MESSAGE = (
+	"If the answer to the task is already visible on the screen, call the `done` action "
+	"immediately with that answer. Do not call `input`, `click`, or any other action first "
+	"to double-check or confirm something you can already read. Only interact with the page "
+	"if the task explicitly requires clicking or typing to reach the answer.\n\n"
+	"When you need to read further into a page than what is currently visible, use the "
+	"`scroll` action with down=true. down=true moves you further into the page toward "
+	"content you have not seen yet; down=false moves you backward toward content you "
+	"already passed. Before each scroll, check whether the screenshot actually changed "
+	"from the previous step — if it looks identical, you scrolled the wrong direction or "
+	"hit the end of the page, and should try the opposite direction or increase pages.\n\n"
+	"When searching for something that is not yet visible and could be far down a long "
+	"page, use a large pages value (3 to 5) per scroll to cover ground quickly, rather "
+	"than the default 1.0 — one page at a time is far too slow to reach content that is "
+	"many screens away. Only switch to smaller scrolls (0.5 to 1.0) once you can see you "
+	"are getting close to the target, so you do not overshoot past it."
+)
+#: 2026-09-05 caveat on the paragraph above: the one passing run measured so far never
+#: actually sent `pages>1.0` — it stuck to the 1.0 default throughout and still reached a
+#: target ~12.8k px down a real page (measured via a live DOM query) in 7 scrolls, likely
+#: because the real (wide) Chrome viewport reflows to a shorter page than the 1280px-wide
+#: measurement used to estimate that figure. The instruction is kept because it is harmless
+#: if ignored and plausibly helps on a page too long for even a correct-direction, right-sized
+#: scroll to reach in a normal step budget — but it has not yet been the deciding factor in
+#: any observed run. Do not cite it as a confirmed fix; re-test if scroll-speed problems
+#: persist on a page long enough to force the model to actually raise `pages`.
+
 #: The overrides PLAN.md §4.3 argues for, with the library default each one replaces.
 #: Not applied automatically by `checked_agent` — it only validates — but `build_agent`
 #: below applies them, so this is the one home for the reasoning.
@@ -53,6 +97,7 @@ ALIASES: dict[str, str] = {
 #: the plan. Each defaults ON and each spends the leased card.
 PLAN_DEFAULTS: dict[str, Any] = {
 	'use_vision': True,  # library default True; the point of leasing a VL model
+	'extend_system_message': DONE_PROMPTLY_MESSAGE,  # 2026-09-05 finding, see above
 	'use_judge': False,  # library default True = one MORE /api/chat after `done`,
 	#                      carrying up to ten screenshots — very likely the largest prompt
 	#                      of the whole run, on the leased card, and absent from history.

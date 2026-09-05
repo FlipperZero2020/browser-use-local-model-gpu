@@ -1644,3 +1644,123 @@ gate rather than by inspection:
 Two smaller corrections of the same kind, both from measurement rather than reading:
 `pkill -f` killed its own shell (exit 144), and `cmd | tee log` reported *tee's* exit status,
 so a gate that correctly returned 1 looked like a pass. Both are in §7.
+
+**2026-09-05 — the owner ran `tools/browse.py` by hand against Wikipedia and hit "confident
+nonsense" that turned out to be two separate things, only one of which was the model.**
+
+First, a real tooling bug in `tools/browse.py`'s attach path: when Chrome is already running,
+`B.attach()` never navigates to `--url` — it just adopts whichever open tab's URL contains the
+same host (browse.py:79-109). A prior run had left the dedicated Chrome profile sitting on an
+unrelated article (`en.wikipedia.org/wiki/In_the_News`, a real but wrong page — a 1970s CBS
+kids' news show, not the Main Page's "In the news" box), and every subsequent run silently
+drove that stale tab instead of the Main Page, with no error. **Not yet fixed** — the
+workaround used below was `systemctl --user stop browsin-chrome` before each run, forcing
+`B.start(args.url)` to launch fresh. A real fix belongs in `browse.py` (e.g. always navigate
+the chosen tab to `args.url` before handing off to the agent) and is still open.
+
+Second, once that contamination was controlled for (fresh Chrome, verified on the real Main
+Page each time), the model's *reading* was measured correct **3 for 3**: every trial's
+step-1 `memory` field named the right answer from the screenshot alone. The actual defect was
+step discipline — two of the three trials then spent 6-7 more steps retyping that same
+already-correct answer into unrelated `input` elements (one drifting via a stray `click` to
+`en.wikipedia.org/wiki/Freddie_Mercury` and back) before finally calling `done`. Right answer
+either way, 8 steps and ~70s instead of 1 step and ~10s. This matches `qwen2.5vl-32k:7b`'s
+known trouble formatting a clean `done` (§10, Phase 4/1236) — it isn't new, but this is the
+first time it was isolated from a comprehension failure and fixed rather than filed.
+
+The fix, tested as a one-line `extend_system_message` before landing it: *"If the answer to
+the task is already visible on the screen, call the `done` action immediately... Do not call
+`input`, `click`, or any other action first to double-check."* Three more clean trials, same
+task, same page:
+
+| | steps (3 trials) | correct |
+|---|---|---|
+| before | 1, 8, 8 | 3/3, but 2 of 3 padded with dead steps |
+| after | 1, 1, 1 | 3/3, immediately every time |
+
+Confirmed a fourth time through the real `tools/browse.py` entry point (not just the throwaway
+test copy): 1 step, 6s, correct. **Landed as `DONE_PROMPTLY_MESSAGE` in
+`browsin/agent.py`'s `PLAN_DEFAULTS`**, so every caller of `build_agent` gets it without
+having to know to ask.
+
+The methodological point this session re-earned: a couple of ad-hoc runs is anecdote, not
+measurement (§5's own warning, ignored for about an hour before ground-truth-checking the
+actual Wikipedia page caught it). The first "nonsense" answer in this session
+("Gloria Steinem in 1977") was in fact *correct* — "Gloria Steinem" was the real headline,
+"in 1977" was the caption on her accompanying photo — and calling it a model failure without
+checking was as much a checking failure as anything in Phase 4's list above.
+
+Separately raised and **rejected** this session: replacing `qwen2.5vl-32k:7b` with a bigger
+vision model (the owner asked about something described as "Kimi K3 VL"). `Kimi K3` itself is
+a ~2.8T-parameter model, nowhere close to fitting this card. The small member of that family,
+`Kimi-VL-A3B` (MoE, 2.8B active params), is a real Ollama/GGUF-compatible model, but at
+~9.8 GB of weights alone it would likely land at or past this card's ceiling once the same
+~10-15% measured overhead this project keeps finding is added (§10, Phase 3) — and the
+measured problem turned out not to be a comprehension gap a bigger model would fix anyway.
+Not pursued further; `minicpm-v:8b` remains the named fallback if `DONE_PROMPTLY_MESSAGE`
+ever stops being enough.
+
+**2026-09-05, later — starting Phase 5 for real: a 6-task checklist stressing scrolling,
+multi-hop clicks, legitimate typing, a non-Wikipedia site, precise scroll targeting, and the
+"confident nonsense" honesty failure specifically. First task in found a second real bug and
+one test-design mistake of my own — recorded separately so they are not confused for each
+other.**
+
+**A second real bug, independent of `DONE_PROMPTLY_MESSAGE`: the model inverts scroll
+direction while narrating the opposite.** Task 1 (scroll a long article to reach a section
+below the fold) drove `qwen2.5vl-32k:7b` to send `scroll(down=False)` — scroll **up** — on 6
+of its first 7 steps, every one captioned "scrolled down to find the section" in its own
+`memory` field. The schema is not ambiguous (`"down=True=scroll down, down=False scroll up"`,
+default `true`), so this is the model's own semantic mix-up, not an unclear tool. Confirmed
+by the printed effect (`Scrolled up 742px`, six times) matching the wrong parameter, not a
+logging artifact. Tested a fix the same way as `DONE_PROMPTLY_MESSAGE`: one added paragraph —
+scroll `down=true` moves toward unseen content, `down=false` moves backward, and check
+whether the screenshot actually changed before repeating a scroll. Retest, same task: **10 of
+10** scrolls correctly used `down=True`. **Not yet landed in `browsin/agent.py`** — tested
+only in a scratch copy — because the one run available to confirm it also *works* (reaches
+the target, not just points the right way) was invalidated by the next finding.
+
+**My own mistake, caught by checking rather than assumed: Task 1's target does not exist on
+the page I pointed it at.** I asked for the "Wreck" section of `Sinking_of_the_Titanic` and
+graded the run against 1985/Robert Ballard, sourced from a *different* article,
+`Wreck_of_the_Titanic`. Fetching `Sinking_of_the_Titanic`'s actual table of contents after
+the fact: **Background, Ice warnings, 14 April 1912, 15 April 1912, Aftermath, Casualties and
+survivors, Notes, References, Bibliography, External links — no "Wreck" section at all.** The
+model never found it because it is not there, and it did not fabricate an answer either time
+— both runs ended `success: False` with an honest "not found yet" rather than a confident
+wrong guess. That is the correct behavior for content that genuinely is not on the page, and
+it means Task 1 as designed cannot tell the scroll-direction fix's real effectiveness from a
+false negative. **Same rule this file keeps re-learning, this time caught before it was
+written up as a model failure: verify the target before grading the run against it.** Task 1
+needs a real target — a long page with a fact at a known, checkable depth — before it can be
+re-run as a measurement rather than retired as a lesson.
+
+**All 6 tasks completed, 2026-09-05, after landing the scroll-direction fix and re-deriving
+Task 1's target. 5 of 6 passed against independently-verified ground truth; 1 genuine
+"confident nonsense" failure, caught live rather than inferred.**
+
+| # | Task | Result | Detail |
+|---|---|---|---|
+| 1 | Scroll ~12.8k px into `Wreck_of_the_Titanic`, name the rust bacterium | **PASS** | "Halomonas titanicae", correct, 8 steps. Target depth confirmed by a live DOM query (`getBoundingClientRect`) before grading — see above for why that mattered |
+| 2 | Click the bolded name in "In the news", report their birth year | **PASS** | Gloria Steinem → 1934, correct. Clicked the right link first try, but then spent 1 `input` + 4 `scroll` steps after already landing on the answer before calling `done` — `DONE_PROMPTLY_MESSAGE` is weaker right after a navigation than when nothing has changed |
+| 3 | Use the search box for "Ada Lovelace", report her birth year | **PASS** | 1815, correct. Typing still works when the task genuinely calls for it — the fix does not over-suppress real form use. But clicked an inert `<span>` 5 times in a row believing search had not happened yet, even after landing on the right article — a milder case of not re-reading the current screenshot |
+| 4 | Hacker News, report the #1 story | **FAIL** | Step 1 correctly read "Actively exploited sandbox RCE in all Chromium versions" (verified top story) into its own memory, then typed it into an unrelated input instead of finishing (the old habit, on an unfamiliar site). Step 2 **replaced the correct answer with a different, real story** — "Portal by Spotify cut my Claude Code token usage by 90%", actually position #13 — and called `done` with `success: True`. Textbook confident nonsense: fluent, schema-valid, and wrong, with no signal distinguishing it from the correct answer next to it |
+| 5 | Hacker News, report the 15th story by position | **PASS** | "Show HN: Open-Source eInk Bike Computer", exact match. Same stray `input` habit as task 4, but this time the second step did not overwrite the correct answer — confirms task 4's failure is intermittent, not a guaranteed break |
+| 6 | Report on a Main Page section that does not exist ("Weather forecast") | **PASS** | Correctly said the section does not exist, `success: False`, 1 step, no fabrication. This is the regression check that mattered most given today's other change — `DONE_PROMPTLY_MESSAGE` did not make the model more willing to guess when it has nothing to report |
+
+**What this adds up to.** Reading/comprehension held up in every case that stayed on one
+page — 6 of 6 correct when graded fairly. The one failure was not a reading error, it was an
+own-answer overwrite triggered by an unnecessary interaction (typing into something the task
+never asked it to touch), and it only happened once in six chances to reproduce the same
+pattern (tasks 4 and 5 shared the same stray-input habit; only 4 corrupted the answer). Two
+things worth doing before trusting this pattern further: (1) tighten
+`DONE_PROMPTLY_MESSAGE` so that once a `memory` field already states the answer, no further
+action is generated in that same or a later step before `done` — right now the instruction is
+descriptive ("call done immediately") rather than something the grammar or a post-hoc check
+enforces; (2) run tasks 4-style single-page reads several more times each on an unfamiliar
+site specifically, since Wikipedia-only testing cannot surface this — it never happened once
+across ten-plus Wikipedia runs this session, only on the first two Hacker News attempts.
+`minicpm-v:8b` remains untried; nothing in today's results points at the model choice as the
+active ingredient in the one failure — it holds an answer correctly in `memory` and then
+overwrites it, which looks like an agent-loop/instruction-following gap rather than a
+comprehension one.
