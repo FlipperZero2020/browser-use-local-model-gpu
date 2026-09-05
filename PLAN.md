@@ -1036,6 +1036,18 @@ its own triggering.
   `ServiceDriver` plus its own measurement cycle. The escape hatch if Phase 5's gates fail,
   not the starting point.
 
+### Phase 8 — **OPTIONAL. NOT SCHEDULED. Do not start while Phase 5 is open.**
+
+A **second arm** alongside browser-use: Microsoft's **Fara**, a screenshot-native computer-use
+model. Not a model swap inside the current agent — Fara does not *drive* browser-use, it
+replaces the job browser-use does. Same lease, same Chrome, same grader, same run directory; a
+different driver module. **Nothing in the current arm changes, and the six-task table's measured
+83% stays on as the control it already is.**
+
+Written up in full in **§11**, including the arithmetic, the three things that must be measured
+before any of it is worth starting, and why the obvious cheap version — point `ChatOllama` at
+Fara and keep the harness — is the one variant that is guaranteed not to work.
+
 ---
 
 ## 6. The disagreement with this machine's own research, stated plainly
@@ -2391,3 +2403,171 @@ Open: re-run and confirm un-like now clears with the corrected `'Liked'` string.
 still cannot hit the control on a 698-element page, the next lever is to shrink the page — open
 each post on its own URL — rather than to reword again, and that should be settled by
 measurement, not by another prompt draft.
+
+---
+
+## 11. Optional and unscheduled — a second arm: Microsoft Fara (screenshot-native)
+
+*Written 2026-09-05, on the owner's question "would this model help, or would changing it mess
+up what already works?". **Nothing here has been run on this machine.** Every VRAM figure below
+is an **estimate**, marked as such; this file's convention is that a number without a
+measurement behind it does not get to look like one. This section exists so the option is
+recorded properly and can be picked up later — not because it is next.*
+
+### 11.1 What Fara actually is, verified against the model cards
+
+Two generations, and confusing them is the first trap. Almost every blog post and league-table
+entry saying "Fara" means the **2025** model, which is a different base and much weaker.
+
+| Model | Released | Base | Params | On the card here? |
+|---|---|---|---|---|
+| `microsoft/Fara-7B` | 30 Oct 2025 | Qwen2.5-VL-7B | 7B | would fit; superseded, don't start here |
+| `microsoft/Fara1.5-4B` | 17 Jul 2026 | Qwen3.5-4B | 4B | comfortably |
+| **`microsoft/Fara1.5-9B`** | 12 May 2026 | Qwen3.5-9B | 9B | **the interesting one — see 11.5** |
+| `microsoft/Fara1.5-27B` | 17 Jul 2026 | Qwen3.5-27B | 27B | **no.** Q4 weights alone exceed the card |
+
+MIT licence throughout. Context window **262,144**; Microsoft's own guidance is that at least
+~15k is needed to work at all, so this project's existing 32k window is not a blocker and the
+262k is irrelevant to us. Primary training resolution **1440×900**.
+
+Microsoft's reported numbers for **Fara1.5-9B**: WebVoyager **86.6**, Online-Mind2Web **63.4**,
+WebTailBench **32.3**. Those are for **bf16 weights served by vLLM at the full 262k window** on
+their own harness. They are not a prediction for a Q4 GGUF at 32k driving this VM's real Chrome
+over CDP, and Phase 5's six-task table is not WebVoyager. Treat them as a reason to *look*,
+which is exactly the standing rule for `foreign_mib` in `CLAUDE.md` — not as a result.
+
+### 11.2 Why this cannot be a model swap, and why that is the whole point
+
+The tempting cheap version is: change the model string, keep `agent.py`, keep browser-use, keep
+everything. That is the one variant that certainly fails, and it fails quietly in this repo's
+signature way — the grammar still constrains the output, the JSON still parses, and the answer
+is confident nonsense. §5 Phase 5 already names that failure mode; this would manufacture it.
+
+| | browser-use arm (today) | Fara arm |
+|---|---|---|
+| What the model is shown | serialised DOM with **numbered element indices**, screenshot optional | **a screenshot**, plus text history. Card: "we only keep the most recent 3 screenshots" |
+| What the model emits | browser-use's `AgentOutput` JSON, grammar-constrained | `<tool_call>{"name": "computer_use", "arguments": {…}}</tool_call>` |
+| How a target is named | **an integer index** browser-use assigned | **pixel coordinates**, predicted directly |
+| Who resolves the target | browser-use maps index → DOM node → CDP | **nobody.** The coordinates are the action |
+| Action vocabulary | browser-use's registry | `left_click` `right_click` `double_click` `triple_click` `mouse_move` `left_click_drag` `type` `key` `scroll` `hscroll` `visit_url` `history_back` `web_search` `pause_and_memorize_fact` `ask_user_question` `wait` `terminate` |
+
+Fara is trained to *be* the agent loop. Handed browser-use's prompt it would be asked to pick
+indices it was never trained to read, and its coordinate skill — the entire reason it scores
+what it scores — would be dead weight. So the honest experiment is a **second driver**, and the
+honest comparison is arm-vs-arm on the grader that already exists.
+
+There is a real upside hiding in that table, and it is not just the benchmark: a screenshot-only
+agent does not pay for DOM serialisation. §10 records `prompt_eval_count=7412` of a served
+32,768 for the browser-use arm, and the x.com work ran into a **698-element page**. Fara's
+prompt size is a function of image tokens and history depth, not of page complexity — which is
+precisely the axis on which the current arm is known to struggle.
+
+### 11.3 What gets reused, and what is genuinely new
+
+This is the part that makes the option cheap, and it is a direct dividend of the layering rule
+in `CLAUDE.md`: **only `agent.py` imports `browser_use`.** Everything the card, the browser, the
+logging and the grading need is already stdlib-only and arm-agnostic.
+
+| Module | Under a Fara arm |
+|---|---|
+| `browsin/env.py` | **reused unchanged** (and the zero-cloud ordering constraint stops applying — nothing imports `browser_use` on this path) |
+| `browsin/lease.py` | **reused unchanged**, new workload id (11.6) |
+| `browsin/browser.py` | **reused unchanged.** Chrome on CDP 9242, `assert_loopback()` |
+| `browsin/proxy.py` | **reused unchanged.** Still the only place prompt sizes exist |
+| `browsin/interlock.py` | **reused unchanged** |
+| `browsin/fixture.py` | **reused, and it gets stronger** — the canvas nonce test is a *better* test of a model that only ever sees pixels |
+| `browsin/grade.py` | **reused unchanged.** Ground truth is fetched independently, so it never knew which arm produced the answer |
+| `browsin/agent.py` | **not used.** Untouched, still the control arm |
+| `tools/test.py` | `--arm fara` alongside the existing arms; `_enter_run_dir()`'s `TMPDIR` dance is **not needed** on this path |
+| **`browsin/fara.py`** *(new)* | the whole job: screenshot at 1440×900 → prompt → parse `<tool_call>` → dispatch coordinates via CDP `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent` → 3-screenshot history window → `terminate` |
+| `browsin/diagnose.py` | **the one that does not come free.** Its detectors read the browser-use history shape (`docs/browser-use-0.13.8-history-api.txt`). `fara.py` must emit a compatible history dict or the detectors — and the DIAGNOSIS/ROLLUP output this project now depends on for reading a run at all — do not apply |
+
+So: one new module of real substance, one adapter obligation, and a flag. Everything expensive —
+the lease discipline, the card accounting, the browser lifetime, the independent grader, the
+statistics — is already built and is not arm-specific.
+
+### 11.4 The three things to measure before writing any of it
+
+In that order. Each is cheap, each can kill the idea, and none of them requires the driver.
+
+1. **Can the serving stack on that box load a `qwen3_5` vision model at all?** GGUF quants exist
+   and are widely downloaded (`bartowski/Fara1.5-9B-GGUF`, ~255k downloads as of 22 Jul 2026),
+   and the model card lists llama.cpp / Ollama / LM Studio / Jan quantisations. That does not
+   mean **this box's pinned Ollama build** has the architecture. §3.4 already records that
+   Ollama's vision support is per-architecture and not general. **If it does not, this is not a
+   Phase 8 — it is Phase 7's `llama-server` driver first**, which that section already describes
+   as a new `ServiceDriver` plus its own measurement cycle. That is the schedule risk, and it is
+   the whole schedule risk.
+2. **VRAM at a 32k window, measured the way Phase 3 measured it** — load, warm, evict, freed —
+   not estimated from a table (11.5 is a table; it is not evidence).
+3. **Does coordinate clicking survive the trip through CDP?** Fara predicts in its 1440×900
+   training frame; the real window is whatever Chrome is at, and there is device-pixel-ratio and
+   scroll offset in between. An off-by-scale-factor here turns every click into a miss and would
+   read as "the model is bad" rather than "the harness is wrong" — the exact confusion
+   `CLAUDE.md` warns about with `test.py`'s excluded outcomes. Settle it with the fixture page,
+   whose nonce and geometry are known, before anything touches a live site.
+
+### 11.5 VRAM arithmetic — **estimates only**
+
+The card is quiet at **14,126 MiB free** (§10, Phase 3). The current vision workload costs a
+**measured 8,375 MiB**. House convention is estimated cost × **1.10**, and §10 records that the
+last estimate came in **11.5% low**, so treat everything in this table as optimistic.
+
+| Candidate | Weights (est.) | Total at 32k with vision (est., ×1.10) | Verdict |
+|---|---|---|---|
+| Fara1.5-4B, Q8 | ~4.3 GB | ~7.0–7.7 GB | comfortable; the safe first load |
+| **Fara1.5-9B, Q4_K_M** | ~5.6–6.0 GB | **~9.0–10.5 GB** | **plausible — near the current 8,375 MiB, which is the point** |
+| Fara1.5-9B, bf16 | ~18 GB | — | does not fit |
+| Fara1.5-27B, Q4 | ~16–17 GB | — | does not fit; weights alone exceed the card |
+
+The headline is that the model worth wanting is roughly the size of the model already running.
+This is not a hardware upgrade question. It is a driver question.
+
+### 11.6 Warden work
+
+A new declared workload — `ollama:fara1.5-9b` or, if 11.4(1) sends this to llama.cpp, a workload
+under whatever driver Phase 7 builds. `cost_mib` booked at the **measured** figure from 11.4(2),
+at the **same window the client will request**, because §3.1's rule is unchanged: one number,
+two places, and `lease.py` refuses to start on a mismatch.
+
+The policy edit follows the hard rule verbatim — **`scp` a `.py`, run it with
+`D:\warden\venv\Scripts\python.exe`.** Never a regex, never through PowerShell quoting; policy
+is re-read on every acquire, so a bad edit takes out clonin too, immediately.
+
+### 11.7 What would make it a pass
+
+Nothing new is needed to judge this, which is the nicest thing about the option. Run the same
+six-task table under both arms and let the existing machinery answer:
+
+```bash
+venv/bin/python -u tools/test.py run --reps 3 --arms default,fara
+venv/bin/python tools/test.py compare runs/test-run-A runs/test-run-B
+```
+
+`compare` already reports Wilson intervals and Fisher exact. **Gate: Fara1.5-9B beats the
+browser-use arm's 15/18 = 83% (80% CI 69–92%) by a margin Fisher can actually separate, on the
+same task table, same day, same grader.** Anything less is a tie, and a tie means keep what
+works. §10's own warning applies to whoever runs this: read the ROLLUP and the DIAGNOSIS blocks
+before the rate, and remember `FIXTURE_STALE` / `TRUTH_UNAVAILABLE` / `RACY` / `SETUP_FAILED`
+are excluded and are not model failures.
+
+### 11.8 Honest cost, and the recommendation
+
+Roughly: **half a day** for 11.4's three measurements; **two to four days** for `fara.py` and
+the `diagnose.py` adapter if Ollama can serve it; **considerably more** if it needs Phase 7's
+`llama-server` driver first, because that is a separate project with its own measurement cycle.
+
+**Recommendation as of 2026-09-05: do not start.** Phase 5 is open, the arm in hand measures
+83% on the six-task table, and the owner is not unhappy with it. The value of Phase 5 was never
+the rate — it was the machinery that produces an honest rate, and that machinery is exactly what
+makes this experiment cheap *whenever* it is run. The option does not expire. Finish Phase 5.
+
+### 11.9 Sources
+
+- `microsoft/fara` on GitHub — the Fara1.5 family overview
+- `https://hf.co/microsoft/Fara1.5-9B` — action space, 3-screenshot history, 262,144 context,
+  1440×900, serving options, benchmark table
+- `https://hf.co/microsoft/Fara1.5-4B`, `.../Fara1.5-27B`, `.../Fara-7B` — bases and dates
+- `https://hf.co/bartowski/Fara1.5-9B-GGUF` — that a llama.cpp-format quant exists at all
+
+Checked 2026-09-05. Model cards move; re-verify before acting on any of it.
