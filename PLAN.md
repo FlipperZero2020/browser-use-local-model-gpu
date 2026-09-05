@@ -1,13 +1,22 @@
 # browser_use_local_model_GPU — lease the card, then let a local model drive a browser
 
-> **Status: 2026-09-04 — Phases 0 through 3 PASSED.** The grammar gate is cleared
-> (browser-use's real 21,980-char `AgentOutput` schema compiles into a working Ollama
-> grammar in 8.1 s, and qwen3's thinking mode does *not* break it), the repo is pinned and
-> makes no cloud calls, `browsin/lease.py` holds the card from asyncio and gives it back
-> on every path out — including the SIGTERM that stranded one during Phase 1 — and the
-> first vision model is on the box, measured (**8375 MiB**), declared as
-> **`ollama:qwen2.5vl-32k:7b`** (a derived Modelfile tag, not the bare pull — see Phase 3),
-> and leased/round-tripped end to end through this VM. Phases 4–7 are unbuilt.
+> **Status: 2026-09-04 — Phases 0 through 4 PASSED. The local vision model drives the
+> owner's real Chrome.** The grammar gate is cleared (browser-use's real 21,980-char
+> `AgentOutput` schema compiles into a working Ollama grammar in 8.1 s, and qwen3's thinking
+> mode does *not* break it), the repo is pinned and makes no cloud calls, `browsin/lease.py`
+> holds the card from asyncio and gives it back on every path out — including the SIGTERM
+> that stranded one during Phase 1 — the first vision model is on the box, measured
+> (**8375 MiB**), declared as **`ollama:qwen2.5vl-32k:7b`** (a derived Modelfile tag, not the
+> bare pull — see Phase 3), and **Phase 4's gate passes 14 of 14 with six control runs that
+> each make it fail**: the model read a five-character code that existed only as canvas
+> pixels, clicked a button, and moved a tab it did not create. First vision prompt measured
+> at **7,412 tokens of a served 32,768 (23%)**. Phases 5–7 are unbuilt.
+>
+> **Read "What this is, in plain language" below first if you are coming to this cold.**
+> The one caveat that belongs next to the headline: the *plumbing* is deterministic, but the
+> two conditions that depend on the model's judgement are not. The demonstration run on
+> Wikipedia got its answer **wrong** — see Phase 4 — and quantifying that is Phase 5's whole
+> job, not something this status line gets to assert.
 > This file is the design doc and the status log. Everything under "Verified today" was measured live against
 > `192.168.1.111` and against this VM on 2026-09-01; everything else is marked
 > `[ASSUMPTION]` or `[VERIFY]` and is somebody's job to settle before it is trusted.

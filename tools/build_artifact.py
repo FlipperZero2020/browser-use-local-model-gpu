@@ -175,18 +175,18 @@ main{padding:40px 40px 120px; min-width:0}
     <nav id="toc"></nav>
   </aside>
   <main>
-    <div class="eyebrow">Design doc &amp; status log &middot; 2026-09-04 &middot; phases 0-3 passed</div>
+    <div class="eyebrow">Design doc &amp; status log &middot; 2026-09-04 &middot; phases 0-4 passed</div>
     <div class="strip">
       <div class="strip-h">Measured, not remembered &mdash; 192.168.1.111, 2026-09-01 to 2026-09-04</div>
       <div class="strip-g">
-        <div class="cell"><span class="k">phases passed</span><span class="v ok">0 &middot; 1 &middot; 2 &middot; 3</span></div>
-        <div class="cell"><span class="k">longest hold</span><span class="v">603 s</span></div>
+        <div class="cell"><span class="k">phases passed</span><span class="v ok">0 &middot; 1 &middot; 2 &middot; 3 &middot; 4</span></div>
+        <div class="cell"><span class="k">gate checks</span><span class="v ok">14 of 14</span></div>
         <div class="cell"><span class="k">ghosts booked</span><span class="v ok">0</span></div>
-        <div class="cell"><span class="k">book available</span><span class="v">12489 MiB</span></div>
+        <div class="cell"><span class="k">first prompt</span><span class="v">7412 tok / 32768</span></div>
         <div class="cell"><span class="k">ollama</span><span class="v">0.32.15</span></div>
         <div class="cell"><span class="k">browser-use</span><span class="v">0.13.8</span></div>
-        <div class="cell"><span class="k">vision models</span><span class="v ok">1 declared</span></div>
-        <div class="cell"><span class="k">next</span><span class="v">phase 4</span></div>
+        <div class="cell"><span class="k">controls that fail</span><span class="v ok">6 of 6</span></div>
+        <div class="cell"><span class="k">next</span><span class="v">phase 5</span></div>
       </div>
     </div>
     <article class="doc" id="doc"></article>
