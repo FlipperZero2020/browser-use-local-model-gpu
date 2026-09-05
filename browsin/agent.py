@@ -46,19 +46,73 @@ ALIASES: dict[str, str] = {
 }
 
 #: The overrides PLAN.md §4.3 argues for, with the library default each one replaces.
-#: Not applied automatically — a caller passes what it wants and this module only
-#: validates — but kept here so the reasoning has one home. Phase 4 consumes it.
+#: Not applied automatically by `checked_agent` — it only validates — but `build_agent`
+#: below applies them, so this is the one home for the reasoning.
+#:
+#: Six of these were added on 2026-09-04 after reading the installed library rather than
+#: the plan. Each defaults ON and each spends the leased card.
 PLAN_DEFAULTS: dict[str, Any] = {
 	'use_vision': True,  # library default True; the point of leasing a VL model
-	'use_judge': False,  # library default True = one extra full LLM call per run
+	'use_judge': False,  # library default True = one MORE /api/chat after `done`,
+	#                      carrying up to ten screenshots — very likely the largest prompt
+	#                      of the whole run, on the leased card, and absent from history.
 	'max_history_items': 8,  # library default None = unbounded context growth
-	'llm_timeout': 600,  # library default None resolves to 75 s for an ollama name
-	'step_timeout': 900,  # library default 180
-	'max_actions_per_step': 2,  # library default 5
-	'max_failures': 5,  # library default 5, restated because it is load-bearing
-	'calculate_cost': False,  # library default False; usage is None on this path anyway
+	'llm_timeout': 600,  # library default None resolves to 75 s for an ollama name.
+	#                      NOTE: this budget covers the empty-action RETRY as well — both
+	#                      calls sit inside one `asyncio.wait_for` — so it must fit two
+	#                      full prefills, not one. The plan had this backwards.
+	'step_timeout': 900,  # library default 180. Must exceed llm_timeout + DOM build +
+	#                      action execution; it is the outer guillotine, not a 2x multiple.
+	'max_actions_per_step': 1,  # library default 5. One, not two: at two, the gate cannot
+	#                      tell an invented element index from a DOM that legitimately
+	#                      changed under the second action.
+	'max_failures': 5,  # library default 5, restated because it is load-bearing: the run
+	#                      only stops at max_failures + final_response_after_failure = 6
+	#                      consecutive failures, each allowed a full llm_timeout.
+	'calculate_cost': False,  # library default False; usage is zeros on this path anyway
 	'enable_signal_handler': False,  # library default True — see the note below
+	'message_compaction': False,  # library default True. Its LLM defaults through to the
+	#                      leased model, it is untimed, it runs before the step's budgeted
+	#                      call, and it prepends up to 6 000 chars to every later prompt.
+	'enable_planning': False,  # library default True. Adds two branches to the grammar
+	#                      (including an unbounded array of strings) and, from step 5,
+	#                      appends a nudge message to every step.
+	'loop_detection_enabled': False,  # library default True. Serialises the whole DOM a
+	#                      SECOND time each step just to hash it, on this VM's CPU, inside
+	#                      the leased window.
+	'directly_open_url': False,  # library default True. It scans the task for a URL and
+	#                      injects a navigate as a synthetic step 0 — which would make the
+	#                      Phase 4 gate's "the model moved the tab" condition unfalsifiable.
 }
+
+#: Actions removed from the registry before the model ever sees them.
+#:
+#: This is not tidiness. Every action's parameter model is inlined into the `format=`
+#: JSON schema on *every* request, so the list is also a prompt-size lever — but the
+#: reason each of these is here is specific:
+#:
+#: * `extract`      — two hardcoded 120 s calls to the same leased model that `llm_timeout`
+#:                    cannot reach, and a 100 000-char page-markdown cap that is the
+#:                    realistic way one request overflows `num_ctx`. `search_page` does the
+#:                    same job with no LLM call.
+#: * `close`        — Chrome exits with its last tab. The model must not hold that lever
+#:                    over the owner's browser.
+#: * `evaluate`     — arbitrary JavaScript in a browser carrying the owner's live cookies.
+#:                    PLAN.md §7 names prompt injection while holding real logins as the
+#:                    top risk in this project; this is its shortest path.
+#: * the file actions — `read_file` / `write_file` / `replace_file` / `upload_file` /
+#:                    `save_as_pdf` give a model that reads attacker-controlled page text a
+#:                    filesystem and an upload button. §7: never give this agent a file tool.
+DEFAULT_EXCLUDED_ACTIONS: tuple[str, ...] = (
+	'extract', 'close', 'evaluate',
+	'read_file', 'write_file', 'replace_file', 'upload_file', 'save_as_pdf',
+)
+
+#: Substrings that change the Agent's behaviour purely from the model's *name*, silently.
+#: `'deepseek' in model.lower()` sets `use_vision = False` at construction with only a
+#: warning — so a vision model whose tag contained it would be leased, measured, and never
+#: sent a single image. `grok-3` / `grok-code` do the same.
+VISION_KILLING_SUBSTRINGS = ('deepseek', 'grok-3', 'grok-code')
 
 
 def valid_agent_kwargs() -> frozenset[str]:
@@ -107,3 +161,118 @@ def checked_agent(**kwargs: Any) -> Agent:
 	"""
 	check_agent_kwargs(kwargs)
 	return Agent(**kwargs)
+
+
+# ── Phase 4: the three constructions, each with its own trap ───────────────────────────
+
+def build_llm(*, host: str, model: str, num_ctx: int, connect_timeout_s: float = 10.0):
+	"""`ChatOllama` pointed at `host`, with `num_ctx` on the wire and the traps asserted.
+
+	Three of these asserts exist because the failure they catch is *silent*:
+
+	* **The port is not optional.** ollama's client treats a bare `http://host` as port 80,
+	  so a missing `:11434` does not error — it connects somewhere else, or nowhere.
+	* **The model name can turn vision off by itself** (`VISION_KILLING_SUBSTRINGS`).
+	* **`num_ctx` is one number in two places.** The same constant must reach
+	  `browsin.lease.hold(num_ctx=…)`, which reads `/api/ps` and refuses to start on a
+	  mismatch. Nothing in browser-use validates it: `Agent._verify_and_setup_llm` has an
+	  empty body and contacts nothing, so a wrong host or tag first shows up as a
+	  fabricated `502` on step 1 — after the lease is taken and Chrome is up.
+
+	A plain dict rather than `ollama.Options`: a typo in the `Options` form is dropped by
+	`model_dump(exclude_none=True)` and sends *no options at all*, which would leave the
+	card serving its default window while warden's book says otherwise. A dict typo at
+	least reaches the wire, where `/api/ps` can catch it.
+	"""
+	import httpx
+
+	from browser_use import ChatOllama
+
+	if ':11434' not in host:
+		raise ValueError(
+			f'host={host!r} carries no port; ollama silently reads that as port 80 '
+			f'(_client.py:1374). Pass an explicit :11434.'
+		)
+	low = model.lower()
+	bad = [s for s in VISION_KILLING_SUBSTRINGS if s in low]
+	if bad:
+		raise ValueError(
+			f'model tag {model!r} contains {bad}, which makes browser-use set '
+			f'use_vision=False at construction with only a warning. The lease would pay '
+			f'for a vision model that is never sent an image.'
+		)
+	return ChatOllama(
+		model=model,
+		host=host,
+		ollama_options={'num_ctx': num_ctx},
+		# httpx-level only, and NOT the same thing as `llm_timeout`. Left unbounded for
+		# read/write so the proxy and `llm_timeout` are the only clocks that matter.
+		timeout=httpx.Timeout(None, connect=connect_timeout_s),
+	)
+
+
+def build_session(*, cdp_url: str, downloads_path: str):
+	"""`BrowserSession` attached over CDP, passing nothing that would arm a launch path.
+
+	Deliberately absent, each for a measured reason:
+
+	* `executable_path` / `channel` — either one flips `is_local=True`, which is the single
+	  flag that arms every browser-killing path in `LocalBrowserWatchdog`.
+	* `user_data_dir` — a path containing the substring `chrome` triggers a 718 MB
+	  one-way `copytree` of the real profile, and the profile this project attaches to is
+	  literally named `chrome-default`.
+	* `allowed_domains` / `prohibited_domains` — with either set, `SecurityWatchdog` closes
+	  the owner's pre-existing tabs at connect, and Chrome exits with its last tab.
+
+	`downloads_path` IS passed: left unset, browser-use points Chrome's download directory
+	at a temp dir via CDP `Browser.setDownloadBehavior`, and whether Chrome puts it back
+	when the client disconnects is unverified.
+	"""
+	from browser_use import BrowserSession
+
+	return BrowserSession(
+		cdp_url=cdp_url,
+		downloads_path=downloads_path,
+		# Do not grant clipboard-read and friends on the owner's real browser.
+		permissions=[],
+	)
+
+
+def build_tools(exclude: tuple[str, ...] = DEFAULT_EXCLUDED_ACTIONS):
+	"""`Tools` with `exclude` removed — and an error if any name was not actually there.
+
+	`Registry.exclude_action` appends an unknown name and only logs, at DEBUG, when it
+	really deletes something. So a typo (or a name from a different browser-use version —
+	`extract_structured_data` is the one that nearly landed here) is a **silent no-op**,
+	and the caller believes it removed a hazard it never touched. Verify against the live
+	registry instead of trusting the call.
+	"""
+	from browser_use import Tools
+
+	available = set(Tools().registry.registry.actions)
+	missing = sorted(set(exclude) - available)
+	if missing:
+		raise ValueError(
+			f'these actions do not exist in this browser-use, so excluding them would be a '
+			f'silent no-op: {missing}. Registered: {sorted(available)}'
+		)
+	tools = Tools(exclude_actions=list(exclude))
+	left = set(tools.registry.registry.actions)
+	still = sorted(set(exclude) & left)
+	if still:
+		raise ValueError(f'exclusion did not take for {still}')
+	return tools
+
+
+def build_agent(*, task: str, llm, browser_session, tools=None, **overrides: Any):
+	"""`PLAN_DEFAULTS`, then the caller's overrides, through `checked_agent`.
+
+	`checked_agent` catches a name `Agent.__init__` would swallow. It cannot catch a name
+	that is still *valid* but whose meaning moved, which is why `PLAN_DEFAULTS` is applied
+	here rather than left to each caller to remember.
+	"""
+	kwargs: dict[str, Any] = dict(PLAN_DEFAULTS)
+	kwargs.update(overrides)
+	kwargs.update(task=task, llm=llm, browser_session=browser_session,
+	              tools=tools if tools is not None else build_tools())
+	return checked_agent(**kwargs)

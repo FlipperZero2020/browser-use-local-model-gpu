@@ -3,86 +3,74 @@
 Continue the `browsin` project in `~/Documents/claude/browser_use_local_model_GPU`.
 
 **Read first, in this order, before doing anything:**
-1. `PLAN.md` — canonical design doc *and* status log. §5 has the phases and their gates,
-   §7 is "what will bite you" (it has grown a lot), §10 is what has actually been measured.
-   Do not start a second plan file; update this one in place as work lands.
+1. `PLAN.md` — canonical design doc *and* status log. Start with **"What this is, in plain
+   language"** at the top if you are cold. §5 has the phases and their gates, §7 is "what
+   will bite you" (it has grown a lot, and the Phase 4 group at its end is all measured),
+   §10 is what has actually been measured. Do not start a second plan file.
 2. `CLAUDE.md` in this directory — the rules for editing this repo.
 3. The `gpu-box` skill, especially **"A lease won't start, or a model load is crawling"**.
 
-**Already done. Do not redo.** The repo is git now; `git log` is the honest record.
+**Already done. Do not redo.** `git log` is the honest record.
 
-- **Phase 0 PASSED** — pins, the zero-cloud env block, the `**kwargs` guard, `CLAUDE.md`.
-  `venv/bin/python tools/phase0_gate.py` re-runs it in about ten seconds.
-- **Phase 1 PASSED** (before this session) — the 21,980-char `AgentOutput` schema compiles
-  into a working Ollama grammar in 8.1 s. Leave thinking ON.
-- **Phase 2 PASSED** — `browsin/lease.py` holds the card from asyncio and gives it back on
-  every path. `tools/phase2_gate.py` is the gate (~22 minutes, run it in the background);
-  `tools/test_lease_offline.py` is 18 checks that need neither warden nor the card.
-- All design decisions are settled in §1. Do not re-litigate them; if evidence contradicts
-  one, say so and ask.
+- **Phases 0, 1, 2, 3 PASSED** — pins and the zero-cloud env block; the 21,980-char
+  `AgentOutput` schema compiling into a working Ollama grammar; `browsin/lease.py` holding
+  the card from asyncio and giving it back on every path; and the vision model
+  `ollama:qwen2.5vl-32k:7b` measured at **8375 MiB** and declared in `policy.json`.
+- **Phase 4 PASSED 2026-09-04** — the local vision model drives the owner's real Chrome
+  over CDP. `tools/phase4_gate.py` is the gate: **14 checks, and six control runs prove it
+  can fail.** New modules: `browsin/browser.py` (start/attach Chrome, prove the debug port
+  is loopback-only), `browsin/proxy.py` (the logging reverse proxy that is the *only* way to
+  see prompt size, since `history.usage` is zeros on this path), `browsin/fixture.py` (the
+  canvas-nonce page that separates "a screenshot was sent" from "the model read it").
+- `tools/browse.py` is the demonstration path — same lease, same Chrome, same proxy:
 
-**Your job: Phase 3 — but it needs the owner before it can start.** (§5 defines it.)
+      venv/bin/python -u tools/browse.py --url https://en.wikipedia.org/wiki/Main_Page \
+          --task "Find today's featured article and report its title."
 
-Phase 3 pulls a 6 GB model and edits the live `policy.json`, so two things are the owner's
-call, not yours:
+**Your job: Phase 5 — real tasks, externally verified.** (§5 defines it.) Then Phase 6 puts
+`browsin` on PATH with a config and a skill.
 
-- **The Defender exclusion is still unapplied** (`ExclusionPath` is empty), so a genuinely
-  cold load takes ~190 s. It is a security setting and the owner runs it, in an elevated
-  shell on the box: `Add-MpPreference -ExclusionPath "D:\Models\OLAM"`. Phase 3 works
-  without it — `start_timeout_s` is 600 — it is just slow.
-- **The measurement window.** §5 Phase 3 step 3 runs `measure_footprints.py` on the box,
-  which stands up a second engine beside the live service and makes it deny admissions for
-  the duration, and it wants `clonin-frontdoor` gated so a stranger's page load cannot take
-  a lease mid-measurement. §8 records the owner already agreed to ~10 minutes of that;
-  confirm it is still fine before you start.
+**Phase 5's gate needs one thing Phase 4 turned up.** Element-reference resolution rate
+cannot be read from `history.errors()`: for `click` and `input`, a missing index returns
+`ActionResult(extracted_content=…)`, not `.error`, so `errors()` reports zero on exactly the
+failure being measured. Scan `extracted_content` for
+`not available - page may have changed`. Run at `max_actions_per_step=1` or the gate cannot
+tell an invented index from a DOM that legitimately changed under a second action.
 
-Then, in order: `gemma3:4b` as the cheap architecture smoke test (does this Ollama build
-run *any* vision model?), then `qwen2.5vl:7b`, then measure, then declare it in policy.
-
-**The verification loop is the point, not a formality.** Implement → run the gate →
-diagnose failures from **measurement** (`/v1/events`, `/api/ps`, `foreign_mib`,
-`D:\warden\logs\ollama-server.log`) → re-run. Never mark a phase done in §10 without
-pasting the gate's actual output. If a gate fails twice for the same reason, stop and
-report rather than trying a third variation.
-
-**And check the gate itself.** Phases 0 and 2 produced **four false passes** between them,
-including one written into the plan. A gate that cannot fail has not passed. Before
-trusting a new one, make it grade a run you deliberately broke.
+**The thing most likely to shape Phase 5's numbers.** Roughly one step in three, the model
+emits `"action": [{}]` — structurally empty, allowed by the grammar because every action
+field is optional, matching no union member. browser-use retries and runs still complete,
+but they cost extra steps. §7 has the full signature. If Phase 5's completion rate
+disappoints, shrinking the action registry or testing `flash_mode` is the first lever, not
+a different model.
 
 **Live state as of handoff (re-verify, do not trust):**
-- warden `:8130` healthy; card idle — free ~13910, **foreign ~2450 (this is the baseline)**,
-  committed 0, ghost 0, no tenants or leases.
-- `ollama:qwen3:8b` is the only model this project has leased. Still no vision model pulled.
-- Chrome is **not** running with CDP on `127.0.0.1:9242`. Phase 4 needs it; Phase 3 does not.
-- `.env` in this directory still says `OLLAMA_MODEL=qwen3-32k:8b`, which **policy.json does
-  not declare**. Nothing browsin wrote reads it, but browser-use calls `load_dotenv()`.
+- warden `:8130` healthy. `foreign_mib` idles ~2200–2600 on a **quiet** card and sits at
+  ~2740 with a tenant resident — that is a CUDA context, not a leak. Only gate on it when
+  `tenants` is empty.
+- The owner's decisions, 2026-09-04: drive the **browser-use copy** profile
+  (`~/.config/browseruse/profiles/chrome-default`, holds real cookies), **stop and ask**
+  before displacing the clonin voice service, keep everything in `PLAN.md` rather than a
+  second doc.
+- `.env` still says `OLLAMA_MODEL=qwen3-32k:8b`, which is not what this project leases.
+  Nothing browsin wrote reads it, but browser-use calls `load_dotenv()`.
 
-**Will bite you** (the full list is §7; these are the ones that cost time this session):
-- A lease `start_timeout` **destroys** the load rather than abandoning it, so retries fail
-  identically. Deterministic, not flaky.
-- **A warm Windows file cache hides the cold-load problem.** A second lease for a model
-  loaded minutes ago goes ACTIVE in ~15 s, not ~190 s. Do not read that as a fix.
-- `foreign_mib` above ~2,600 means a leaked in-flight load that shows in neither `/api/ps`
-  nor warden's tenants. Wait for baseline before trusting any VRAM number.
-- **Release does not free VRAM.** `idle_linger_s` is 180 s for both ollama workloads, then
-  the stop, then up to 30 s of verification. Anything asserting on free VRAM straight after
-  a DELETE will fail for the wrong reason.
+**Will bite you** (the full list is §7):
+- Anything holding a lease runs in the **background** or with a long timeout.
 - Never hand-start anything warden owns; never send `keep_alive: 0`; never edit
-  `policy.json` with a regex or through PowerShell quoting — `scp` a `.py` and run it with
-  `D:\warden\venv\Scripts\python.exe`.
-- Don't `ping` the box (ICMP dropped) and don't reboot it (this VM is a guest on it).
-- Anything holding a lease runs in the **background** or with a long timeout. And if you
-  kill such a thing, check `/v1/status` afterwards — `handle_signals=False` callers take a
-  bare SIGTERM, which runs neither `finally` nor `atexit`.
+  `policy.json` with a regex.
+- Don't `ping` the box and don't reboot it — this VM is a guest on it.
+- `pkill -f` matches the killing shell's own argv. Kill by pid.
+- `cmd | tee log` reports **tee's** exit status, so a failing gate looks like a pass.
 
 **Environment:**
 ```bash
 cd ~/Documents/claude/browser_use_local_model_GPU
 export WARDEN_URL=http://192.168.1.111:8130
-export WARDEN_TOKEN_FILE=$HOME/.config/warden/token   # never WARDEN_TOKEN
+export WARDEN_TOKEN_FILE=$HOME/.config/warden/token   # the file, never WARDEN_TOKEN
 venv/bin/python ...
 ```
 
-When Phase 3's gate passes, update `PLAN.md` §5 and §10 with the measured result, run
+When a phase's gate passes, update `PLAN.md` §5 and §10 with the **pasted output**, run
 `python3 tools/build_artifact.py`, and republish the **same file path** to keep the artifact
 URL (https://claude.ai/code/artifact/8f877eff-3915-4231-b27d-0a9e4526fefa).

@@ -28,6 +28,63 @@
 
 ---
 
+## What this is, in plain language
+
+*Added 2026-09-04 at the owner's request. Everything below this section is the technical
+record; this section is the orientation for coming back to it cold. It deliberately
+contains no jargon — where a term is unavoidable, the technical name is in brackets so it
+can be searched for further down.*
+
+**The idea.** There is a Windows PC on the home network with a graphics card in it. This
+project borrows that card, loads an AI model that can *see* pictures onto it, and lets that
+model look at a Chrome window on this Linux machine and click things in it. Nothing is sent
+to any company's servers — the model runs on the card, and the browser runs here.
+
+**Why it is not just "run the AI".** The card is small and only one thing can use it at a
+time, so a separate program called **warden** rations it. You do not start the model; you
+*ask warden for a turn* [take a lease] and it starts the model for you. If you start it
+yourself, warden loses track of how much of the card is in use and starts handing the same
+memory to two programs at once. Most of the care in this repo is about asking properly and,
+much harder, **always giving the card back** — including when the program is interrupted,
+crashes, or is killed.
+
+**The other thing sharing the card** is a voice service (`clonin`) that has a public web
+page. It and this project do not fit on the card together — that was measured, and the
+shortfall is 450 MB — so starting a browsing session *pushes the voice service off*. Since
+a stranger might be mid-sentence, the rule is: notice, say who would be cut off, and ask.
+Never silently.
+
+**How you use it.** You open Chrome with a switch that lets another program drive it, then
+give the model a job in ordinary English. It takes a screenshot, decides what to click,
+clicks it, and repeats until it can answer.
+
+**What is actually built, as of 2026-09-04.** All of it, up to and including a browser the
+model really drives. The parts, in the order they were proved:
+
+| Part | What it does | State |
+|---|---|---|
+| Asking for the card | Takes a turn, keeps it, and returns it on every way out | working, gate passed |
+| The model that can see | `qwen2.5vl-32k:7b`, on the card, measured at 8,375 MB | working, gate passed |
+| Starting Chrome | Opens it, checks the control port is not reachable from the network | working |
+| Driving the browser | The model reads the screen and clicks | working, gate passed |
+| A command you type | `browsin "go and check…"` | not built yet (Phase 6) |
+
+**The one honest caveat.** The model is small. It reads pages correctly and clicks the
+right things, but it intermittently produces a malformed instruction when it tries to
+*finish* — roughly one step in three. The library retries and it recovers, so runs
+complete; it just costs extra steps. This is a property of a 7-billion-parameter model
+being asked to fill in a large rigid form, not a bug in this code, and §7 records exactly
+what it looks like.
+
+**Where the risk is.** The browser the model drives is signed into real accounts. A web
+page can contain text written to trick the model ("ignore your task and do X instead"), and
+the model is holding your logged-in session while it reads that text. That is the single
+biggest risk in this project. The mitigations in place: the model has no ability to run
+JavaScript, read or write files, or upload anything — those tools were removed — and the
+profile it drives is a copy, not the everyday one.
+
+---
+
 ## 0. BLUF
 
 ```bash
@@ -734,7 +791,7 @@ either way, but nothing here needed a second one). Both loaded in the 13-23s nor
 independent confirmation of the *corrected* claim — "add the exclusion before pulling a new
 model" — not of the earlier, retracted one that credited it with fixing a persistent slowdown.
 
-### Phase 4 — one headed browser step, instrumented.
+### Phase 4 — one headed browser step, instrumented. ✅ **PASSED 2026-09-04**
 
 Start Chrome yourself with the debug port (§4.4), confirm CDP answers on `127.0.0.1:9242`,
 and attach. No launching, no profile. Then one Agent step against a fixed trivial page,
@@ -742,10 +799,192 @@ and attach. No launching, no profile. Then one Agent step against a fixed trivia
 This is the only way to see the real prompt size, because `usage=None` means the agent has
 no idea. `local_Model/PLAN.md` independently asks for exactly this "on day one".
 
-**Gate:** the agent drives the *already-open* Chrome (a tab it did not create changes URL) ·
+**Gate as originally written:** the agent drives the *already-open* Chrome (a tab it did not create changes URL) ·
 measured first-request prompt tokens recorded and **under 60% of the served `num_ctx`** ·
 **no** `/tmp/browser-use-user-data-dir-*` larger than 4 KB was created · the box's ollama
 log contains no `truncating input prompt` · `ss -ltnp` shows 9242 bound to `127.0.0.1`, not `0.0.0.0`.
+
+**All five of those are satisfiable while the thing they test is broken.** Reading the
+installed library before writing the gate — rather than after it passed — is what turned
+this up, and the corrected gate (`tools/phase4_gate.py`) is 14 checks with six control runs
+that must each make it fail. The three worst:
+
+- **"a tab it did not create changes URL"** — `directly_open_url` (default **True**) scans
+  the task string for a URL and injects a navigate as a *synthetic step 0*, written into
+  history with `model_output.action = initial_actions`. `history.model_actions()` walks
+  every item, so the URL appears there whether the model chose it or the library did. Fixed
+  by grading only `step_number >= 1`, passing `directly_open_url=False`, and asserting the
+  task string contains no URL at all.
+- **"no `/tmp/browser-use-user-data-dir-*` larger than 4 KB"** — that directory is minted
+  empty by a pydantic field validator; the 718 MB `copytree` beside it fires on a branch the
+  CDP-attach path never reaches. **The condition cannot fail.** Replaced by a scan of the
+  run's whole `TMPDIR`, a diff of the real `/tmp`, and a check that no `Cookies` /
+  `Login Data` / `Web Data` / `Local State` file exists anywhere beneath either.
+- **"measured first-request prompt tokens"** — `history.usage` is **zeros by construction**
+  on the Ollama path, so browser-use cannot answer this at all. The number exists only in
+  ollama's own `prompt_eval_count`, which `ChatOllama` discards. Hence `browsin/proxy.py`.
+  And it must come from the *same request that carried the screenshot*, or the measurement
+  rewards a run that sent no image.
+
+**Gate output, 2026-09-04, run 4** (`runs/phase4_gate_run4.log`; card had the model resident
+from a previous run's idle linger, so the acquire was warm):
+
+```
+preflight: free=5238 foreign=2741 ghost=0 committed=0 tenants=['ollama:qwen2.5vl-32k:7b'] leases=0
+   (foreign_mib 2741 not gated: 1 tenant(s) resident, which inflates it above the idle baseline)
+fixture on http://127.0.0.1:41603  nonce='VEYV4'
+chrome pid=61980 bind=127.0.0.1 Chrome/152.0.7977.82
+lease granted in 0.1s  endpoint=http://192.168.1.111:11434 served num_ctx=32768
+
+  [PASS] G0  the agent was constructed and the run was attempted
+  [PASS] G1  a pre-existing tab changed URL, and a model action did it
+         moved=['4D4582B34A4715F637E44269EC57ABA8'] clicked_at_step>=1=True
+         initial_actions=None task_contains_url=False
+  [PASS] G2  first vision prompt under 60% of the served window
+         prompt_eval_count=7412 budget=19660 (0.60 x served 32768)
+         request text chars=24997 chars/6=4166 seq=1
+  [PASS] G3  a real screenshot reached the model
+         1 image(s), dimensions=[[1906, 742]] sha256[0]=e302922b8ff4e2a7
+  [PASS] G4  the model read the canvas nonce (pixels only, not in the DOM)
+         nonce='VEYV4' in final_result=True is_done=True last_step=4
+         final_result="The access code is 'VEYV4'."
+  [PASS] G5  no response shows truncation or a non-stop finish
+         7 chat exchange(s); offenders=none
+         prompt_eval_counts=[7412, 7473, 7499, 7581, 7607, 7593, 7619]
+  [PASS] G6  the box ollama log records no truncation for this run
+         scanned 16014 new bytes from offset 101420730; hits=none
+  [PASS] G7  the CDP port stayed bound to loopback, and the LAN refused
+         sampled binds=['127.0.0.1'] across 6 samples; LAN connect refused=True
+  [PASS] G8  every LLM call went through the proxy
+         llm_host=http://127.0.0.1:11434 proxy_upstream=http://192.168.1.111:11434
+         lease_endpoint=http://192.168.1.111:11434 chat_requests=7 history_steps=4
+  [PASS] G9  the lease was held continuously across the run
+         6/6 samples held, expected >= 4 for a 28.8s run
+  [PASS] G10 model still resident at the booked window after the run
+         {'ok': True, 'served_num_ctx': 32768}
+  [PASS] G11 temp footprint contained, and no profile data copied
+         gettempdir=<run>/tmp  entries=[('browser-use-downloads-28e1dbd9', 0),
+         ('browser-use-user-data-dir-gu3odvu3', 0),
+         ('browser_use_agent_…', 73469), ('downloads', 0)]
+         oversized=[] sensitive=[] new in real /tmp=[] cwd=[]
+  [PASS] G12 browsin owns SIGINT/SIGTERM, and no judge call was made
+  [PASS] G13 the owner's Chrome survived and lost no tabs
+
+PHASE 4 GATE (normal): 14 of 14 passed
+```
+
+**Re-run after the G5 fix, and this is the authoritative pass.** Run 4 above was graded by a
+G5 that could not fail (see the controls below), so it does not get to be the record. Run 6,
+against the corrected gate, passed **14 of 14** independently — a different nonce, a
+different tab id, and a noticeably worse path through the task:
+
+```
+  [PASS] G4  nonce='HLK3R' in final_result=True is_done=True last_step=8
+  [PASS] G5  9 chat exchange(s); offenders=none
+         prompt_eval_counts=[7414, 7475, 7501, 7567, 7703, 7840, 8063, 8209, 8373]
+  [PASS] G9  12/12 samples held, expected >= 10 for a 59.5s run
+PHASE 4 GATE (normal): 14 of 14 passed
+```
+
+Run 6 is the more honest picture of what this model does, and it is worth reading closely.
+It took **8 steps to run 4's 4**, spent three of them waiting and three clicking nothing,
+and its final answer *describes the page wrongly* — "the page did not change… the page is
+empty" — while nonetheless ending "The access code shown is `'HLK3R'`". Both halves are
+explicable and neither is a plumbing fault: page two's DOM genuinely has no interactive
+elements, so the serialised DOM it reasons over really does look empty, while the canvas it
+was *looking at* really did say HLK3R. **The DOM said nothing and the pixels said the code,
+and the model reported the code.** That is the vision path working, and it is also a preview
+of exactly the "confident nonsense" §5 Phase 5 warns about: a run whose narrative is wrong
+and whose answer is right, which no schema check and no `done` flag can tell apart.
+
+**The prompt budget is not tight.** 7,412 tokens of a served 32,768 — **23%** — with the
+full-page screenshot, the 12,101-byte `format=` schema and eight history items included, and
+it grew only to 7,619 over seven calls. §3.1's arithmetic was pessimistic; the binding
+constraint on this workload is not the context window.
+
+**The gate was then made to fail, six ways, before it was trusted.** A gate that has never
+failed has not passed — phases 0 and 2 produced four false passes between them, and this
+project does not get to skip the step. Each control changes exactly one thing:
+
+| `--mode` | what it breaks | must fail | observed |
+|---|---|---|---|
+| `blank-canvas` | the canvas is empty; the page is otherwise byte-identical | **G4 only** | **G4 failed, G3 still passed** — 13/14 |
+| `no-vision` | `use_vision=False` | G3, G4 | G2, G3, G4 failed — 11/14 |
+| `direct-url` | a URL in the task + `directly_open_url=True` | G1 | G1, G4, G12 failed — 11/14 |
+| `no-proxy` | `ChatOllama` pointed straight at the box | G8 | G2, G3, G5, G8 failed — 9/14 |
+| `signals` | `enable_signal_handler=True` | G12 | G12 failed — 13/14 |
+| `oversize` | a 400 000-char prompt through the same proxy | G5 | G5 failed *(only after a fix — see below)* |
+
+`blank-canvas` is the one that matters most: **G3 passed and G4 failed on the same run.** A
+screenshot was still on the wire, of the right dimensions, and the model still could not
+produce a code that was not in the pixels. That is the difference between "an image was
+sent" and "the model read it", and no other check in the gate can tell them apart.
+
+**The `oversize` control found a real hole in the gate itself, on its first run.** G5
+*passed* when it had to fail. The rule read `if pec is not None and pec >= served`, so an
+exchange whose response carried **no** `prompt_eval_count` was silently skipped — the exact
+"I could not check, so I passed" shape `browsin/lease.py` and `tools/phase2_gate.py` already
+forbid, reintroduced in a new file. What made it visible is worth recording: an over-window
+request comes back **200 OK carrying only `{"model": …, "done": …}`** — no
+`prompt_eval_count`, no `done_reason`, no `message`. A missing count *is* the truncation
+signal on this build, not the absence of one. Corrected, and re-run:
+
+```
+  [FAIL] G5  no response shows truncation or a non-stop finish
+         1 chat exchange(s); offenders=['seq1:done_reason=None',
+         "seq1:no prompt_eval_count in response (keys=['done', 'model'])"]
+```
+
+**Two earlier runs failed, and both failures were mine rather than the system's.** Run 1
+returned all-FAIL from a `str.replace` that patched the *first* matching line — inside the
+`--mode oversize` branch — so `session.stop()` was spliced in before `session` existed, and
+a blanket `except Exception` swallowed the resulting `NameError` and returned early. Run 3
+was refused outright by the interlock on `foreign_mib`, correctly per the rule as written and
+wrongly in substance (§7). Both are recorded because the gate *did the right thing both
+times*: it failed loudly rather than passing, and `G0 the run was attempted` was added so a
+crash before the agent exists reads as one cause rather than thirteen symptoms.
+
+**The demonstration run, on a real site, got the answer wrong — and that is the most useful
+result of the day.** `tools/browse.py` against `en.wikipedia.org/wiki/Main_Page`, asked for
+*"the title of the article featured in the 'From today's featured article' section"*:
+
+```
+ANSWER: The title of the featured article on the Wikipedia main page is 'Egyptian goose'.
+6 steps in 47s, done=True
+  step 1: ['scroll']   step 2: []   step 3: []   step 4: ['input']
+  step 5: ['input']    step 6: ['done']
+prompt tokens per call: [11572, 11658, 11684, 11670, 11696, 11682, 11708, 10758, 11552]
+images per call:        [1, 1, 1, 1, 1, 1, 1, 1, 1]
+```
+
+The correct answer was **"the second and final season of *1923*"**, and it was on screen,
+above the fold, when the run started. Every part of the machinery did its job — nine calls,
+an image on every one, ~11.6k tokens against a 32,768 window (**35%**, on a page far busier
+than the fixture), no truncation, lease held and returned.
+
+**What the model did is worth stating exactly, because it is not hallucination.**
+"Egyptian goose" *is* on that page — in the **"Recently featured:"** list underneath
+*today's featured **picture***, at the very bottom. Step 1 was a `scroll`, away from the
+featured article it had already been shown, and it then reported a real string from the
+wrong section as the answer. This is §7's "confident nonsense" in its purest form: schema
+valid, `done=True`, `is_done()` true, a fluent sentence, and wrong. **No gate that trusts
+the agent's own `done` could catch it** — which is precisely why Phase 5's conditions are
+machine-checkable equality against a known answer, and why §5 says never the agent's own
+`done` action.
+
+It also sharpens what Phase 5 must measure. Two of six steps were empty-action failures and
+two more were `input` into the search box, so the *useful* action rate here was 2 of 6. That
+is the number Phase 5 exists to establish over repeated runs, and this single run is not it.
+
+**What Phase 4 leaves for Phase 5, stated as a warning rather than a result.** The gate
+passes, and every *plumbing* condition in it is deterministic — the lease, the proxy, the
+loopback binding, the temp footprint and the residency assertions do not depend on what the
+model says. G1 and G4 do. They require the model to click the right thing and to read five
+large black characters, and this is a 7B model: run-to-run variance is real and Phase 5's
+whole job is to measure it rather than assert it. Do not read "14 of 14" as "reliable"; read
+it as "the pipeline is sound and the first end-to-end run succeeded". The completion-rate
+number belongs to Phase 5, over repeated runs, and §5's instruction to report it *with no
+disqualifying floor on the first pass* is the right posture for it.
 
 ### Phase 5 — real tasks, externally verified.
 
@@ -981,6 +1220,73 @@ Ordered by how expensive the surprise is.
 - **PowerShell far side.** `ssh gpubox "…"` is parsed by bash locally *and* PowerShell
   remotely. Use `-EncodedCommand` or `scp` a `.ps1`. A red `NativeCommandError` block is
   stderr, not necessarily failure — check `$LASTEXITCODE`.
+
+### Added by Phase 4, 2026-09-04 — all measured on this machine, not read
+
+- **The model emits an EMPTY action object, and the grammar allows it.** Roughly one step
+  in three, `qwen2.5vl-32k:7b` returns `"action": [{}]` when it wants to finish. Every field
+  of the action union is optional, so `{}` satisfies the `format=` grammar — and then
+  matches no member of the union, so pydantic reports
+  `Input should be a valid dictionary or instance of …ActionModel [input_value=PydanticUndefined]`
+  against **all fifteen members at once**. That signature means a structurally empty action,
+  *not* a wrong choice of action and not a broken schema: a one-shot reproduction
+  (`tools/diag_done.py`) confirmed the same schema, sent to the same model, round-trips and
+  validates perfectly on a short prompt. browser-use has two separate handlers for it —
+  "Model returned empty action. Retrying…" inside `_get_model_output_with_retry`, and
+  `Invalid model output format` counted against `max_failures` — so runs recover and
+  complete. **Budget steps for it.** `MAX_STEPS` of 8 absorbed three occurrences in the run
+  that passed. This is a small model filling in a 12 kB rigid form, not a defect in this
+  repo, and it is the strongest argument in the file for eventually shrinking the action
+  registry or testing `flash_mode`.
+- **Chrome's browser process rewrites its own `/proc/self/cmdline` into one NUL-free
+  string.** It sets its process title, so the usual `split('\0')` yields a *single* element
+  holding the whole command line, while its renderer/GPU/zygote children keep proper NUL
+  separation. A token-membership test therefore returns False for the exact process that
+  owns the debug port and True for the children — precisely inverted. This silently disarmed
+  the "Chrome is already running on this profile" guard until it was measured;
+  `browsin/browser.py` now normalises to a string and matches on argument boundaries.
+- **`foreign_mib`'s idle baseline only means anything on a card with no tenants.** With
+  `ollama:qwen2.5vl-32k:7b` resident from a previous run's idle linger, `foreign_mib` sits
+  stable at **2740** — above the 2200–2600 idle range recorded above — and stays there. That
+  is the CUDA context of a legitimately resident tenant, which warden books under `cost_mib`,
+  not the leaked in-flight load the rule exists to catch. Gating on the absolute number
+  regardless of tenancy produced a false refusal; the check is now scoped to a quiet card.
+- **`Tools(exclude_actions=[…])` silently no-ops on a name that does not exist.**
+  `Registry.exclude_action` appends the name and only logs, at DEBUG, when it actually
+  deletes something. `extract_structured_data` — the name an earlier analysis confidently
+  recommended excluding — **does not exist in 0.13.8**; the action is `extract`. Excluding
+  the wrong name leaves the hazard live while the caller believes it is gone.
+  `browsin.agent.build_tools` verifies against the live registry and raises instead.
+- **Under CDP attach the process never exits on its own.** browser-use's CDP auto-reconnect
+  keeps the loop alive after the work finishes, so a script that just falls off the end of
+  `main()` hangs forever. `await session.stop()` is required — and is safe here, because its
+  browser-kill branch is guarded by `is_local and _subprocess` and both are false on the
+  attach path. It also ends `StorageStateWatchdog`'s 60-second poll of the owner's cookie
+  jar, which **is** running: contrary to the natural reading of the source, binding the
+  profile to the session re-runs the `user_data_dir` validator, so `user_data_dir` is never
+  None and the watchdog is always enabled.
+- **browser-use adopts `page_targets[0]`, which is not the foreground tab.** It is
+  dict-insertion order of concurrently-attached targets. On the `chrome-default` profile an
+  Adblock Plus "what's new" tab has already come first once, on the very first launch.
+  Select the tab by URL and dispatch `SwitchTabEvent`; never trust the index.
+- **Launch Chrome straight onto the target URL, never onto a new-tab page.** `connect()`
+  navigates every new-tab-page target to `about:blank` *and mutates the cached URL*, so the
+  `TabCreatedEvent` that follows matches `about:blank` exactly and `AboutBlankWatchdog`
+  paints a full-viewport black overlay, retitles the tab, and makes **Chrome** fetch
+  `https://cf.browser-use.com/logo.svg`. Starting on a real page means none of it fires.
+  `--host-resolver-rules="MAP cf.browser-use.com ~NOTFOUND,…"` is the belt to that brace —
+  it is the only lever, since the request comes from the browser and no environment variable
+  reaches it. Chrome shows a permanent "unsupported command-line flag" banner as a result;
+  cosmetic, but the owner will see it.
+- **`use_judge` defaults True and costs one more `/api/chat` after `done`,** carrying up to
+  ten screenshots — very likely the largest prompt of the run, on the leased card, and
+  invisible in `history`. `llm_timeout` covers the empty-action **retry** as well as the
+  first call, so it must fit two full prefills, not one.
+- **`pkill -f <pattern>` matches the killing shell's own argv.** It killed this session's
+  own tool call, exit 144, mid-diagnosis — the same self-inflicted failure the `gpu-box`
+  notes already record. Kill by pid, after matching `/proc/<pid>/cmdline`.
+- **`… | tee file` makes the pipeline's exit status `tee`'s**, so a gate that correctly
+  returned 1 reported success. Redirect instead, or set `pipefail`.
 
 ---
 
@@ -1292,3 +1598,40 @@ tenant before it acquires, names who would be displaced, and requires an explici
 `--evict` to proceed, `--wait` to queue behind the 120 s idle linger. It never evicts a
 public service silently. §1, §4.4 and §8 updated; this is now an implementation obligation
 for Phase 6's CLI, not a documentation note.
+
+**2026-09-04 — Phase 4 PASSED. The model drives the browser.** A local vision model on the
+LAN GPU box read a page it had never seen, clicked a button, moved a tab it did not create,
+and reported a five-character code that existed *only* as canvas pixels. Full gate output,
+the six control runs that prove the gate can fail, and the corrected conditions are in §5
+Phase 4. Four new modules: `browsin/browser.py`, `browsin/proxy.py`, `browsin/fixture.py`,
+and `build_llm` / `build_session` / `build_tools` / `build_agent` in `browsin/agent.py`.
+
+The measured numbers that change how the rest of this file should be read:
+
+| | measured | what it displaces |
+|---|---|---|
+| first vision prompt | **7,412 tokens** | §3.1's arithmetic was pessimistic — this is **23%** of the served 32,768, with the screenshot, the 12,101-byte `format=` schema and 8 history items all included |
+| prompt growth over 7 calls | 7,412 → 7,619 | `max_history_items=8` holds it flat; unbounded history was the right thing to fix |
+| screenshot on the wire | 1906×742 PNG, sha256 verified | proves the vision path end to end, independently of what the model then said |
+| warm lease acquire | **0.1 s** | vs 24.4 s from cold-in-linger, vs the 190 s of one bad window on 09-01 |
+| whole run | 28.8 s, 4 steps, 7 LLM calls | on a warm card |
+| real `/tmp` litter | **zero**, across nine runs | `TMPDIR` + `tempfile.tempdir` before the import relocates all four families |
+
+**A methodological note this session earned the hard way, three times.** Every failure in
+Phase 4 was a *checking* failure rather than a system failure, and each was found by the
+gate rather than by inspection:
+
+1. A `str.replace` patched the first matching line instead of the intended one, and a
+   blanket `except Exception` swallowed the resulting `NameError` — 13 checks failed at once
+   with no traceback. `G0 the run was attempted` now exists so this reads as one cause.
+2. The `foreign_mib` interlock refused a legitimate run, because an idle-card baseline was
+   being applied to a card with a tenant resident. Right rule, wrong scope.
+3. **G5 could not fail.** It skipped any response with no `prompt_eval_count`, so the
+   oversize control passed. This is the same "I could not check, so I passed" shape that
+   `browsin/lease.py:297` and `tools/phase2_gate.py:234` were written to forbid — and it was
+   reintroduced in a brand-new file by the same author on the same day. **The rule is not
+   "remember not to do this"; it is "run the control".** Nothing else would have found it.
+
+Two smaller corrections of the same kind, both from measurement rather than reading:
+`pkill -f` killed its own shell (exit 144), and `cmd | tee log` reported *tee's* exit status,
+so a gate that correctly returned 1 looked like a pass. Both are in §7.
