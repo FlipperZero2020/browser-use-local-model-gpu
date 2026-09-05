@@ -100,11 +100,16 @@ def wikipedia_itn_lead() -> list[str]:
 	"machine-checkable" is that the expectation cannot be older than the run it grades.
 	"""
 	html = _get('https://en.wikipedia.org/wiki/Main_Page')
-	m = re.search(r'id="mp-itn".*?<ul>(.*?)</ul>', html, re.S)
+	i = html.find('id="mp-itn"')
+	if i < 0:
+		raise FixtureStale('no id="mp-itn" on the Main Page')
+	# `<ul[^>]*>`, not `<ul>`: the live markup is Parsoid output and the list carries
+	# attributes. The bare form silently matched a list much further down the page.
+	m = re.search(r'<ul[^>]*>(.*?)</ul>', html[i:i + 20000], re.S)
 	if not m:
 		raise FixtureStale('could not locate the "In the news" list on the Main Page')
 	first_bullet = re.split(r'</li>', m.group(1))[0]
-	bold = re.search(r'<b>\s*<a[^>]*>(.*?)</a>\s*</b>', first_bullet, re.S)
+	bold = re.search(r'<b[^>]*>(.*?)</b>', first_bullet, re.S)
 	if not bold:
 		raise FixtureStale('first ITN bullet has no bolded link')
 	return [_strip_tags(bold.group(1)).strip()]
@@ -192,6 +197,12 @@ TASKS: list[Task] = [
 		prompt=("Use the search box at the top of the page to search for 'Ada Lovelace'. After "
 		        "the page loads, report the year she was born. Then call done."),
 		expect=wikipedia_contains('Ada_Lovelace', ['1815']),
+		# 14, not the default 8: at 8 this scored 1/3, and both failures ran out of budget
+		# mid-task rather than answering wrongly — the model types the query fine, then burns
+		# steps re-clicking a search control it has already used. Raising the ceiling is how
+		# "too slow" gets separated from "cannot do it"; the 1/3 at 8 steps stands as its own
+		# measurement (§10, 2026-09-05).
+		max_steps=14,
 	),
 	Task(
 		name='hn-top-story',
@@ -341,6 +352,25 @@ async def main() -> int:
 						raise
 					run_dir = RUN_DIR / f'{task.name}-rep{rep}'
 					row = await run_one(task, expected, card, proxy.url, run_dir)
+
+					# Re-derive ground truth *after* the run. The Hacker News front page
+					# reorders continuously, so an expectation fetched 60 s before the model
+					# read the screen can be stale by the time it answers — and grading that
+					# as a model failure would be exactly the mistake this file's docstring
+					# warns about. A run whose truth moved under it is inconclusive, not
+					# failed, and is excluded from the rate rather than counted against it.
+					try:
+						after = task.expect()
+					except Exception:
+						after = expected
+					if after != expected and not row['correct']:
+						row['racy'] = True
+						row['expected_after'] = after
+						results[task.name].append(row)
+						print(f'[{task.name} rep{rep}] RACY — ground truth moved during the run '
+						      f'({expected} -> {after}); not counted', flush=True)
+						continue
+
 					results[task.name].append(row)
 					mark = 'PASS' if row['correct'] else 'FAIL'
 					extra = ''
@@ -356,7 +386,7 @@ async def main() -> int:
 	print('\n' + '=' * 78)
 	print('PHASE 5 — task completion, graded against independently fetched ground truth')
 	print('=' * 78)
-	total = passed = lost = 0
+	total = passed = lost = racy_n = 0
 	for task in tasks:
 		rows = results[task.name]
 		if task.name in stale:
@@ -364,21 +394,31 @@ async def main() -> int:
 			continue
 		if not rows:
 			continue
-		ok = sum(1 for r in rows if r['correct'])
-		hl = sum(1 for r in rows if r['had_then_lost'])
-		steps = sum(r['steps'] for r in rows) / len(rows)
-		waste = sum(r['wasted_actions'] for r in rows) / len(rows)
-		total += len(rows)
+		graded = [r for r in rows if not r.get('racy')]
+		racy = len(rows) - len(graded)
+		racy_n += racy
+		if not graded:
+			print(f'  {task.name:<20} all {racy} run(s) inconclusive (ground truth moved)')
+			continue
+		ok = sum(1 for r in graded if r['correct'])
+		hl = sum(1 for r in graded if r['had_then_lost'])
+		steps = sum(r['steps'] for r in graded) / len(graded)
+		waste = sum(r['wasted_actions'] for r in graded) / len(graded)
+		total += len(graded)
 		passed += ok
 		lost += hl
 		flag = f'  had-then-lost x{hl}' if hl else ''
-		print(f'  {task.name:<20} {ok}/{len(rows)} correct   '
+		flag += f'  ({racy} inconclusive)' if racy else ''
+		print(f'  {task.name:<20} {ok}/{len(graded)} correct   '
 		      f'avg {steps:.1f} steps, {waste:.1f} wasted actions{flag}')
 
 	if total:
 		print(f'\n  completion rate: {passed}/{total} = {100 * passed / total:.0f}%')
 		print(f'  of the {total - passed} failure(s), {lost} had the correct answer in memory '
 		      f'and dropped it')
+		if racy_n:
+			print(f'  {racy_n} run(s) excluded as inconclusive: the page changed mid-run, so '
+			      f'the answer could not be graded either way')
 	print(f'\n  run dir: {RUN_DIR}')
 	print('  NOTE: graded on ground truth, never on the agent\'s own done/success flag.')
 

@@ -28,6 +28,56 @@ venv/bin/python ...
 shell history and skill files as the expected leak path for this credential, and an
 environment variable is one `ps` away from both.
 
+## Commands
+
+Nothing here is a `pytest` suite. Each phase's gate is a standalone script that measures the
+real thing and prints its own verdict; `tools/test_lease_offline.py` is the only test that
+fakes anything. **Exit codes are uniform: `0` passed, `1` failed, `2` refused to start** (the
+interlock below), so a gate can be scripted — but `cmd | tee log` reports *tee's* status, and
+a failing gate then looks like a pass.
+
+```bash
+# Offline. No card, no browser, no network — safe to run at any time, in the foreground.
+venv/bin/python tools/phase0_gate.py           # pins, zero-cloud env, the retired-kwarg guard
+venv/bin/python tools/test_lease_offline.py    # lease cancel/signal paths against a fake warden
+
+# These hold the real card. Background or a long timeout, and ONE AT A TIME.
+venv/bin/python tools/phase2_gate.py                       # ~20 min, six lease checks
+venv/bin/python tools/phase2_gate.py --only lost,sigint    # or: sigterm,assert,hold,freed
+venv/bin/python tools/phase3_gate.py                       # vision workload: resident, right num_ctx
+venv/bin/python tools/phase4_gate.py                       # 14 checks, headed Chrome, canvas nonce
+venv/bin/python tools/phase4_gate.py --mode no-vision      # a CONTROL run — it is meant to FAIL
+venv/bin/python tools/phase5_gate.py --reps 3              # all six tasks, graded on fetched truth
+venv/bin/python tools/phase5_gate.py --only hn-top-story --reps 5
+
+# The demonstration path, not a gate. Same lease, same Chrome, same proxy.
+venv/bin/python -u tools/browse.py --url https://en.wikipedia.org/wiki/Main_Page \
+    --task "Find today's featured article and report its title."
+
+# Housekeeping. Neither needs the card.
+python3 tools/sweep_tmp.py                     # report only
+python3 tools/sweep_tmp.py --yes               # actually delete
+python3 tools/build_artifact.py                # regenerate PLAN.artifact.html
+```
+
+Four things about running them:
+
+- **`--evict` is the only way past the clonin interlock**, and it exists on `browse.py`,
+  `phase4_gate.py` and `phase5_gate.py`. Without it, a card held by the public voice service
+  is an exit-2 refusal with a printed explanation, not a failure. Do not add it reflexively:
+  clonin's `idle_linger_s` is 120 s, so waiting is usually the right answer.
+- **`phase4_gate.py --mode` runs controls** (`blank-canvas`, `no-vision`, `direct-url`,
+  `no-proxy`, `signals`, `oversize`). Each one breaks the thing a specific check claims to
+  test, so a control that passes everything means the gate cannot fail. They exit `0` when
+  their target check fails, which is the point.
+- **`phase5_gate.py` grades against ground truth it fetches itself**, never against the
+  agent's own `done`/`success` flag. A `FIXTURE-STALE` line means the live page moved and the
+  expectation could not be built — that is not a model failure and must not be written up as
+  one.
+- **Every entry point writes `runs/<name>-<timestamp>/`** (gitignored): `proxy.jsonl`,
+  `conversation/`, and `evidence.json` or `results.json`. `proxy.jsonl` is the *only* place
+  prompt sizes exist — see `browsin/proxy.py` for why `history.usage` cannot answer.
+
 ## Hard rules
 
 - **Never hand-start anything warden owns**, and never `taskkill` a tenant. A driver
@@ -45,6 +95,54 @@ environment variable is one `ps` away from both.
 - **`:11434` answers without a lease and always will.** An unleased call does not fail,
   it *succeeds*, loading weights outside warden's book. A successful `curl` is never
   evidence you are doing it right.
+- **Never fan `ultracode`/Workflow subagents out across anything that takes a lease or
+  drives the real browser.** One GPU slot, one real Chrome window — concurrent agents
+  contend for the same lease (most just block or fail) or drive the same window at once,
+  and an agent that routes around a busy lease by hand-starting Ollama trips the first
+  rule above. Fine for read-only work (code review, research, PLAN.md drafting); never
+  for Phase 5 task testing or any live agent run — those stay one at a time.
+
+## The shape of the code
+
+`browsin/` is the library; `tools/` is every entry point. The layering is not cosmetic —
+`lease.py`, `browser.py`, `proxy.py`, `fixture.py` and `interlock.py` are **stdlib-only and
+do not import `browser_use`**, which is what lets `browsin.lease` hold the card without
+paying the seconds, the `/tmp` leak and the telemetry singleton that import costs.
+
+- **`env.py`** — the zero-cloud block, applied on import. Everything else depends on it
+  having run first; see the ordering constraint below.
+- **`lease.py`** — `async with hold(workload, num_ctx=…)` and nothing else. Wraps
+  `warden.client` with the five obligations in its docstring: heartbeat from *acquire*,
+  lease-loss cancels the work, assert what is resident, assert the served window, release on
+  every path including SIGTERM.
+- **`browser.py`** — start or attach the owner's Chrome on CDP port 9242 against the
+  browser-use copy profile, and `assert_loopback()` before anything drives it. browser-use
+  never launches: passing `cdp_url` gates its whole launch block, which is also why the agent
+  structurally cannot close the browser. Process lifetime belongs to this module alone.
+- **`proxy.py`** — a logging reverse proxy on `127.0.0.1:11434` forwarding to the leased
+  endpoint. It relays the exact bytes that arrived; parsing happens on a copy. Never let it
+  normalise `num_ctx`, `model`, `options` or `keep_alive` — that would put warden's book
+  wrong rather than merely this run's numbers.
+- **`agent.py`** — the only module that imports `browser_use`. **Nothing calls `Agent(...)`
+  directly; call `checked_agent(...)`.** `Agent.__init__` ends in a `**kwargs` it never
+  reads, so every retired 0.9.7-era parameter constructs cleanly and does nothing at all —
+  no `TypeError`, no warning, no log line. That is what let a plan written for 0.9.7 appear
+  to work against this venv for weeks. The guard turns it back into an exception.
+- **`fixture.py`** — the two-page local site whose nonce is painted into a `<canvas>` and
+  exists nowhere in the DOM. It is what separates "a screenshot was sent" from "the model
+  read it"; `assert_nonce_not_in_dom()` proves that property rather than assuming it.
+- **`interlock.py`** — `card_preflight()`, in its own module because both the gates and
+  `browse.py` need it and importing `phase4_gate` for it would silently redirect the caller's
+  temp files into a stray run directory.
+
+**A new entry point must copy `tools/browse.py`'s header before it imports anything.**
+`TMPDIR`, `tempfile.tempdir` and `BROWSER_USE_CONFIG_DIR` are set to the run directory at the
+top of the file, because one of the four temp-directory families is created at browser-use's
+*import* time and `tempfile.gettempdir()` caches its answer the first time anything asks.
+
+**`requirements.txt` pins with `==` on purpose. Never relax one to `>=`.** An unpinned
+`pip install browser-use` is the root cause of the divergence PLAN.md §10 exists to record;
+the file's own comments carry the reasoning and the verified warden commit.
 
 ## Two ordering constraints in the code
 

@@ -1764,3 +1764,76 @@ across ten-plus Wikipedia runs this session, only on the first two Hacker News a
 active ingredient in the one failure — it holds an answer correctly in `memory` and then
 overwrites it, which looks like an agent-loop/instruction-following gap rather than a
 comprehension one.
+
+### Phase 5 — the gate exists, and the first real number is 72%
+
+**2026-09-05 — `tools/phase5_gate.py` and `tools/test_phase5_grade_offline.py`.** Hand-running
+tasks and reading logs is what produced the mistakes above; this replaces it. The gate runs a
+task table N times under **one lease**, restarts Chrome per run (working around the still-open
+attach bug), and grades every run against ground truth **the harness fetches itself** — the
+ITN lead and the Hacker News front page are scraped immediately before each run, and the
+"stable" fixtures are re-verified live so a rotted one reports `FIXTURE-STALE` instead of
+being charged to the model. §5's rule is enforced structurally: `grade()` never reads
+`is_done()` for correctness.
+
+**First measured completion rate, 6 tasks x 3 reps, graded on ground truth:**
+
+```
+  wiki-itn-lead        3/3 correct   avg 1.0 steps, 0.0 wasted actions
+  wiki-scroll-deep     3/3 correct   avg 11.7 steps, 0.0 wasted actions
+  wiki-search-box      1/3 correct   avg 8.0 steps, 0.0 wasted actions
+  hn-top-story         1/3 correct   avg 6.0 steps, 4.0 wasted actions  had-then-lost x1
+  hn-15th-story        2/3 correct   avg 8.0 steps, 5.3 wasted actions
+  wiki-absent-section  3/3 correct   avg 1.0 steps, 0.0 wasted actions
+
+  completion rate: 13/18 = 72%
+```
+
+**Hand-testing had said 83% (5 of 6) the same afternoon. It was luck**, and the gap between
+those two numbers is the entire argument for the harness. §10 keeps recording this lesson;
+this is the first time the project has had the instrument to avoid it.
+
+**`had_then_lost` is a real, recurring failure mode, not an anecdote.** The detector fires
+when the expected string appears in some step's `model_output.memory` and is absent from the
+final answer — "understood the page, then threw the answer away", which wants a completely
+different fix from "never understood it". Three confirmed occurrences so far, all on
+`hn-top-story`, and twice it produced *the same* wrong answer ("The Highest Point in the
+Netherlands"), so whatever it is attending to is systematic rather than random.
+
+**Two hypotheses tested against the follow-up probe (4 reps, the two weak tasks):**
+
+1. **`wiki-search-box` is not step-starved.** Raising `max_steps` 8 -> 14 did not convert
+   failures into slow successes; the distribution is bimodal — 3, 3 steps when it works,
+   **14, 14 when it fails**. A stuck run stays stuck, so budget is the wrong lever. It types
+   the query correctly and then re-clicks a search control it has already used, never
+   registering that the results page loaded.
+2. **Wasted actions correlate with wrong answers, but the evidence is confounded and is
+   recorded as a hypothesis, not a result.** Across 31 graded runs, `wasted_actions == 0`
+   scores 17/21 (81%) and `>= 1` scores 5/10 (50%) — but essentially every high-waste run is
+   Hacker News and every zero-waste run is Wikipedia, so site and waste cannot be separated
+   in this sample. The only clean within-task split is `hn-top-story` itself: 2/2 correct at
+   0-1 wasted actions, 1/5 at 3-5. Directionally consistent, far too small to assert.
+
+**The race guard, added after the first batch and immediately earned.** The Hacker News front
+page reorders continuously, and a run graded against an expectation fetched 60 s earlier can
+fail for reasons that have nothing to do with the model. The gate now re-derives ground truth
+*after* each run and marks a disagreeing run `RACY` — excluded from the rate, not counted
+against it. It fired on its first outing: `Actively exploited sandbox RCE in all Chromium
+versions` -> `AI handles incidents, engineers lose touch with their systems` mid-run. An hour
+earlier that would have been written up as a model failure.
+
+**A real bug the gate surfaced that no task was looking for: generation was uncapped.** A
+probe run stalled for ~7 minutes with the lease healthy and the proxy silent — one request in
+flight, the model emitting a multi-thousand-line malformed JSON object. §4.3 specifies
+`ollama_options={... "num_predict": 1024}`; `build_llm` shipped only `num_ctx`, so nothing
+bounded generation. Measured across **309 logged generations**: median **162** tokens, p90
+206, p99 250 — and a max of **17,328**. Exactly **2 of 309** exceeded 1024, and both were
+runaways. Uncapped, one of those occupies the full 600 s `llm_timeout` while §3.3's warning
+applies (the request is abandoned, the GPU keeps generating); capped, it truncates into a
+parse failure the existing retry clears in seconds. `num_predict: 1024` is now set, at 4x the
+measured p99, so it cannot clip a legitimate step. **The plan had this right and the
+implementation dropped it** — the same class of silent divergence as §10's `max_steps` and
+`tool_calling_method` findings, and the argument for gates that measure rather than read.
+
+**Not yet re-measured with the cap in place.** The 72% and the probe both predate it, so the
+next batch is the before/after. Do not cite the cap as an improvement until that exists.

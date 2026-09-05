@@ -249,7 +249,16 @@ def build_llm(*, host: str, model: str, num_ctx: int, connect_timeout_s: float =
 	return ChatOllama(
 		model=model,
 		host=host,
-		ollama_options={'num_ctx': num_ctx},
+		# `num_predict` caps generation. §4.3 prescribed 1024 and the implementation dropped
+		# it, so generation was unbounded — measured 2026-09-05 over 309 logged generations:
+		# median 162 tokens, p90 206, p99 250, and a **max of 17,328**. Exactly 2 of the 309
+		# exceeded 1024, and both were runaways: the model emitting a multi-thousand-line
+		# malformed JSON object that never terminates. Uncapped, one of those occupies the
+		# full `llm_timeout` (600 s) before anything reclaims the step, and §3.3's warning
+		# applies — the request is abandoned but the GPU keeps generating. Capped, the same
+		# event truncates into a parse failure that the existing retry handles in seconds.
+		# 1024 is 4x the p99, so it cannot clip a legitimate step.
+		ollama_options={'num_ctx': num_ctx, 'num_predict': 1024},
 		# httpx-level only, and NOT the same thing as `llm_timeout`. Left unbounded for
 		# read/write so the proxy and `llm_timeout` are the only clocks that matter.
 		timeout=httpx.Timeout(None, connect=connect_timeout_s),
