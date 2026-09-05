@@ -991,6 +991,29 @@ def cmd_self_check(_args) -> int:
 	ok('NEXT names a runnable arm for had_then_lost', '--arms default,enforce-read-only' in D.next_footer(rows))
 	rows2 = [{'task': 't', 'arm': 'default', 'outcome': 'NO_ANSWER', 'correct': False, 'steps': 8, 'wasted_actions': 0, 'patterns': {'budget_exhausted': {}}}] * 2
 	ok('NEXT suggests observation, not a bogus arm, for an unmapped pattern', '--label look-budget_exhausted' in D.next_footer(rows2) and '<arm>' not in D.next_footer(rows2))
+	# NOT_A_TARGET: the footer must not chase a symptom shared by unrelated mechanisms, nor a
+	# transport counter. Shaped after runs/test-run-20260905-052408, where stuck_narrative won
+	# with 6 runs that were a 2/2/2 tie across three tasks and four of which graded CORRECT.
+	sn = [{'task': t, 'arm': 'default', 'outcome': o, 'correct': o == 'CORRECT', 'steps': 12, 'wasted_actions': 0,
+	       'patterns': dict({'stuck_narrative': {'n': 7, 'from_step': 2}}, **extra)}
+	      for t, o, extra in (('wiki-scroll-deep', 'WRONG_ANSWER', {'had_then_lost': {'first': 1, 'lost': 2}}),
+	                          ('wiki-scroll-deep', 'CORRECT', {}), ('wiki-search-box', 'CORRECT', {}),
+	                          ('wiki-search-box', 'HONEST_MISS', {}), ('hn-15th-story', 'CORRECT', {}),
+	                          ('hn-15th-story', 'CORRECT', {}))]
+	ok('stuck_narrative never becomes the NEXT target (6 runs, 3 mechanisms, no arm — 2026-09-05)',
+	   'stuck_narrative' not in D.next_footer(sn) and 'had_then_lost' in D.next_footer(sn))
+	ok('… nor the ROLLUP headline, while still showing in the per-task counts',
+	   'stuck_narrative' not in D.rollup(sn).split('most frequent')[-1] and 'stuck_narrative 2/2' in D.rollup(sn))
+	ab = [{'task': 'hn-top-story', 'arm': 'default', 'outcome': 'NO_ANSWER', 'correct': False, 'steps': 6, 'wasted_actions': 0,
+	       'patterns': {'aborted_llm_calls': {'seq': [3]}}} for _ in range(4)] + \
+	     [{'task': 'hn-top-story', 'arm': 'default', 'outcome': 'NO_ANSWER', 'correct': False, 'steps': 6, 'wasted_actions': 0,
+	       'patterns': {'aborted_llm_calls': {'seq': [3]}, 'llm_timeout': {'steps': [3]}}}]
+	ok('aborted_llm_calls loses to llm_timeout — the transport counter is not the mechanism',
+	   'llm_timeout' in D.next_footer(ab) and 'aborted_llm_calls' not in D.next_footer(ab))
+	inv = [{'task': 't', 'arm': 'default', 'outcome': 'WRONG_ANSWER', 'correct': False, 'steps': 4, 'wasted_actions': 0,
+	        'patterns': {'invented_element_index': {'n': 2}, 'done_only_when_forced': {}}}] * 3
+	ok('invented_element_index stays targetable — unobserved is not untargetable',
+	   'invented_element_index' in D.next_footer(inv))
 	inert = [{'task': 'f', 'arm': 'enforce-read-only', 'arm_effective': False, 'outcome': 'CORRECT', 'correct': True, 'steps': 3, 'wasted_actions': 0, 'patterns': {}}] * 6
 	base = [dict(r, arm='default', arm_effective=True) for r in inert]
 	ok('compare reports an inert arm instead of a verdict', 'ARM INERT' in D.compare(base, inert, 'a', 'b'))
@@ -998,6 +1021,23 @@ def cmd_self_check(_args) -> int:
 	ok('rate_line on all-excluded rows does not raise', 'no graded runs' in D.rate_line('x', [{'task': 'x', 'outcome': 'RACY'}]))
 	ok('render tolerates missing screenshot paths and None fields',
 	   'DIAGNOSIS' in D.render(RO, 1, 'default', G.grade(RO, ['W'], _hist(_step(1, 'W', DONE('W')))), {}, _hist(_step(1, 'W', DONE('W'))), None, '/r'))
+	# the trace's URL column: /wiki/Ada_Lovelace and /wiki/Ada_Lovelace_Award are the real pair
+	# a 34-column head-truncation collapsed into one string (wiki-search-box-rep3, step 5).
+	ada = _hist(_step(1, 'searching', {'input': {'index': 321, 'text': 'Ada Lovelace'}}, url='https://en.wikipedia.org/wiki/Main_Page'),
+	            _step(2, 'clicked the result', {'click': {'index': 4296}}, url='https://en.wikipedia.org/wiki/Ada_Lovelace'),
+	            _step(3, 'clicked the result', {'click': {'index': 5010}}, url='https://en.wikipedia.org/wiki/Ada_Lovelace_Award'),
+	            _step(4, 'no year yet', DONE('I could not find her birth year.', False), url='https://en.wikipedia.org/wiki/Ada_Lovelace_Award'))
+	block = D.render(FREE, 3, 'default', G.grade(FREE, ['1815'], ada), {}, ada, None, '/r')
+	ok('the trace shows /wiki/Ada_Lovelace_Award in full, not truncated to /wiki/Ada_Lovelac…',
+	   'en.wikipedia.org/wiki/Ada_Lovelace_Award' in block and 'Ada_Lovelac…' not in block)
+	ok('… so the two Ada URLs both render whole, neither elided into the other',
+	   [D.short_url('https://en.wikipedia.org/wiki/Ada_Lovelace'), D.short_url('https://en.wikipedia.org/wiki/Ada_Lovelace_Award')]
+	   == ['en.wikipedia.org/wiki/Ada_Lovelace', 'en.wikipedia.org/wiki/Ada_Lovelace_Award'])
+	ok('a URL past the column keeps its host and its tail, and never overflows URL_W',
+	   D.short_url('https://engineering.atspotify.com/2026/9/portal-cut-my-token-usage-by-90').startswith('engineering.atspotify.com…')
+	   and D.short_url('https://x.test/' + 'a' * 80).endswith('a' * 8)
+	   and max(len(D.short_url(u)) for u in ('https://x.test/' + 'a' * 400, 'https://' + 'h' * 90 + '.test/p/q',
+	                                         'https://en.wikipedia.org/wiki/A?b=c#a_long_fragment')) <= D.URL_W)
 
 	print('== arms')
 	ok('Arm refuses set:enable_signal_handler', _raises(lambda: Arm('set:enable_signal_handler=true'), SystemExit))

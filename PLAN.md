@@ -1948,3 +1948,233 @@ Open, in order of value: the 8 v 8 for `enforce-read-only`; a DOM-ready wait bef
 starts (kills `blank_first_state` by construction); DOM-snapshot truth from the driven tab
 (closes the HN race instead of excluding it); the §5 thresholds (element-reference resolution,
 error-repair) are still not computed; Phase 6 (`bin/browsin`, config, skill) has not started.
+
+**Second run through the finished tool, and the first batch measured with the `num_predict`
+cap in place** — `runs/test-run-20260905-052408`, the whole table at 3 reps, arm `default`
+only (the user's three commands: `guide`, `self-check` 95/95, `run --reps 3`; lease granted in
+18.4 s, served window 32768, exit 0, warden afterwards `leases=[] tenants=[]`, foreign 2839 flat):
+
+```
+  wiki-itn-lead        3/3 correct (80% CI 65%–100%)   avg 1.0 steps   0.0 wasted
+  wiki-scroll-deep     2/3 correct (80% CI 32%–89%)   avg 12.0 steps   0.0 wasted   WRONG_ANSWER 1   had-then-lost x1
+  wiki-search-box      2/3 correct (80% CI 32%–89%)   avg 10.3 steps   0.0 wasted   HONEST_MISS 1
+  hn-top-story         2/3 correct (80% CI 32%–89%)   avg 3.0 steps   1.0 wasted   WRONG_ANSWER 1   had-then-lost x1
+  hn-15th-story        3/3 correct (80% CI 65%–100%)   avg 6.0 steps   4.0 wasted
+  wiki-absent-section  3/3 correct (80% CI 65%–100%)   avg 1.0 steps   0.0 wasted
+
+  completion rate: 15/18 = 83%  (80% CI 69%–92%)
+  of the 3 miss(es), 2 had the correct answer in memory and dropped it
+
+ROLLUP — patterns per task (count of runs the pattern fired in / graded runs)
+  wiki-scroll-deep     viewport_moved_after_input 3/3, done_only_when_forced 3/3, steps_after_first_seen 3/3, scroll_step_too_small 3/3, stuck_narrative 2/3, answer_retyped_into_input 2/3, had_then_lost 1/3, parse_fail 1/3, runaway_generation 1/3
+  wiki-search-box      repeated_action 2/3, stale_narrative_after_navigation 2/3, stuck_narrative 2/3, done_only_when_forced 2/3, shown_but_never_held 1/3, honest_miss 1/3
+  hn-top-story         empty_action 3/3, blank_first_state 3/3, stray_input_on_read_only 2/3, url_changed_on_read_only 2/3, input_side_effect_navigation 2/3, steps_after_first_seen 2/3, had_then_lost 1/3, viewport_moved_after_input 1/3
+  hn-15th-story        blank_first_state 3/3, stray_input_on_read_only 2/3, repeated_action 2/3, stuck_narrative 2/3, done_only_when_forced 2/3, steps_after_first_seen 2/3
+  adherence: scroll pages>1 used in 0/29 scrolls; scroll direction inverted in 0 runs
+  most frequent fixable pattern across the batch: stuck_narrative (6 runs)
+
+NEXT: most frequent fixable pattern is stuck_narrative (6 runs, mostly wiki-scroll-deep). Open its decisive
+screenshots, write the mechanism as one sentence naming the step, then gather more instances (no arm is
+mapped for this pattern yet — form one as sysmsg:FILE or set:KEY=JSON after reading them):
+      venv/bin/python -u tools/test.py run --only wiki-scroll-deep --reps 4 --label look-stuck_narrative
+```
+
+**What it says.** The mechanism sentences below were produced by a read-only, no-card pass of
+13 agents — four analysts on the screenshots and `history.json`, two adversarial refuters per
+finding (an evidence lens that re-opened the PNGs, a measurability lens that read
+`diagnose.py`/`agent.py`), one synthesizer — and every refutation that stood is what is
+recorded here rather than the analysts' first draft. Four load-bearing claims were then
+re-checked by hand against the raw files: the `diagnose.py` docstring, `proxy.jsonl`'s
+`format_bytes`, the per-step URLs of `wiki-search-box` rep3, and the `interacted_element`
+node names of every `input` in the batch. Nothing was modified before this entry was written.
+
+1. **83% is not a rate claim over the morning's 72%.** Same table, same day, 80% intervals
+   69–92% against the earlier batch; a batch-to-batch swing this size is inside what rule 8c
+   calls noise. What *is* new: 104 LLM calls, prompt median ~13.6k tokens, max 16.3k of the
+   served 32,768, and **the `num_predict` cap's first confirmation at 3 reps** — exactly one
+   runaway in 104 calls (`proxy.jsonl` seq 76, `wiki-scroll-deep` rep3 step 11: 1024 tokens,
+   `done_reason=length`, 27.9 s, the model transcribing a sentence of the Stern section into
+   its JSON). It cost one parse-failed step; the retry answered correctly 7.5 s later; the run
+   was CORRECT. Uncapped, that same call is the seven-minute stall of the entry above.
+
+2. **Both had-then-lost misses, and every wasted action in the batch, are one habit: once the
+   model holds the answer it emits `input(<answer>)` into an arbitrary starred element instead
+   of `done`.** Seven of 18 runs did it (`hn-top-story` rep1 and rep3, `hn-15th-story` rep1
+   and rep3, `wiki-scroll-deep` all three); 15 stray inputs on Hacker News plus 6 retyped on
+   the Titanic article. Whether that costs a step or loses the page is decided by which
+   element it happens to pick, measured from `history.json`: **17 inputs into `<a>` targets →
+   0 navigations; 2 into `<td>` targets → 2 navigations.**
+   - `hn-top-story` rep1 (WRONG_ANSWER): at step 2 `input[55]` typed the correct title into
+     the visible row-1 link; the viewport then sat at the page bottom with row 13 topmost
+     (`…_1788604131/screenshots/step_3.png`) and the model read it as #1; step 3's
+     `input[390]` into a `<td>` navigated to `engineering.atspotify.com` (`step_4.png`) and
+     `done` named the Spotify title. The why behind the `<a>`/`<td>` split — browser-use's
+     `DOM.focus` succeeds on a link so no click is sent, and falls through to a click-to-focus
+     on a cell — is *read from the 0.13.8 source*, not from a debug log (the run dirs keep
+     none); the observed split is consistent with nothing else examined.
+   - `wiki-scroll-deep` rep1 (WRONG_ANSWER): the name was the last line of `step_9.png`
+     (8.0 pages down) and already off the top of `step_10.png` (9.0); at step 10 the model
+     typed `"Halomonas titanicae"` into the section's `[edit]` span, browser-use scrolled that
+     span into view (9.0 → 10.8 pages with no scroll action, `step_11.png` is the Bow section
+     with neither name on screen), and rep1's `memory` — unlike rep2's and rep3's, which said
+     "is Halomonas titanicae" and survived the same jump — never held it. The only carrier
+     left was the typed echo in history; step 11 typed `"rusticles"` into the Silt link and the
+     forced `done` at 12 took the newer of the two echoes.
+
+3. **The persuasion layer is measured inert, in-batch, three ways.** `DONE_PROMPTLY_MESSAGE`
+   was in every prompt and, in those seven runs, the step after the answer appeared was an
+   `input`; in the four runs that repeated it six times, six consecutive prompts carrying the
+   instruction did not move it. The "pages 3 to 5" paragraph: **0 of 29** scrolls (0 of 41
+   across both batches). browser-use's own 328-char BUDGET WARNING context message, injected
+   at steps 11–13 of both frozen `wiki-search-box` runs: steps 11–13 copied the click
+   unchanged. And **every `done` that ended a stuck run arrived under browser-use's done-only
+   schema** — `proxy.jsonl` `request.format_bytes` is 12101 on every call and **2171** at seq
+   13, 27, 40, 54, 77, 91, 103, the seven last-step calls. The grammar is what this 7B obeys;
+   the prose is not. Rule 8a's presumption is now a measurement, and it is the case for
+   `enforce-read-only` — remove the verb — being the next landed change: it has a mapped arm,
+   a 4/4 precedent in the entry above, and it explains both misses.
+
+4. **The NEXT footer is wrong for this batch, for a reason that is a bug.** `stuck_narrative`
+   is one of the three detectors this file's own docstring calls *instrumentation rather than
+   census entries*, and it is not in `NOT_A_TARGET`, so the footer chased it. Its six runs are
+   three unrelated mechanisms (a harmless "reached the section" confabulation while scrolling;
+   the search-box freeze; input-as-report) in a 2/2/2 tie that "mostly wiki-scroll-deep" broke
+   by insertion order. No arm is mapped for it and none could be. Add it to `NOT_A_TARGET`.
+
+5. **`blank_first_state` is now 10 of 10 on Hacker News across both batches, and 0 of 12 on
+   Wikipedia.** The step-1 screenshot is the fully painted front page — byte-identical to
+   step 2 — while the DOM build returned two elements; the reaction was an empty action
+   (`hn-top-story`, 3/3, one step of six gone) or a scroll (`hn-15th-story`, 3/3). The cause is
+   **not identifiable from what is saved** (`page_info` is fetched after the DOM/screenshot
+   build, so it cannot date it), but step 2 had a full DOM in every run, so a re-build before
+   `agent.run` in `tools/test.py`'s `_drive` removes it by construction. It goes in *first*
+   (loop rule 1: harness contamination before an arm), recording builds-until-non-empty and
+   elapsed ms per run so the next batch can tell a first-build defect from load timing. Not
+   `initial_actions=[wait]`: that writes a step-0 history item `grade.steps()` keeps as real.
+
+6. **`wiki-scroll-deep` is mis-flagged.** Its prompt opens "Do not click any links" exactly as
+   `hn-top-story`'s does, nothing needs typing, and it carries `read_only=False` — so the arm
+   skips it, its six inputs are labelled `answer_retyped_into_input` (mapped to no arm), and
+   `wasted` reads 0.0 for a task that wasted six actions. Flip the flag at land time, prompt
+   and `max_steps` untouched so the day's measurements stay comparable; until then
+   `test.py one --read-only` is the no-edit probe path. Its *scroll* problem is separate and
+   unfixed: 26 of 26 scrolls at 742 px on a 33.5-viewport page, the first mention ~8.6 pages
+   down and reached at step 9 of 12, the named section (~13.4 pages) unreachable at one page
+   per step — hence 12/12 in 3/3 reps. A harness clamp on executed scroll distance must floor
+   at **2** pages, not 3: 3×3 = 9.0 is `step_10.png`, the exact frame that lost rep1; 2×4 = 8.0
+   is `step_9.png` with the name on screen. That geometry is a live parse of a page Wikipedia
+   can reflow; re-derive before building anything on it.
+
+7. **`wiki-search-box` rep3 is the good miss, with a fact the tool hid.** Step 4 clicked the
+   typeahead *container* div whose centre is the fourth suggestion, and landed on
+   `/wiki/Ada_Lovelace_Award` — founded 1981, no 1815 anywhere — which the DIAGNOSIS trace
+   truncates to `Ada_Lovelac…`, indistinguishable from the right article. Nine clicks on the
+   inert 18×18 magnifier span followed (`step_6.png` through `step_14.png` identical) until the
+   done-only schema at 14 echoed the stale memory with `success=false`. rep1 froze the same
+   way *on the right article* and passed only because the forced `done` read the page. Both
+   arms proposed for this were refuted as unmeasurable: the library's loop-detection nudge
+   fires only after five identical actions and travels the same context-message path the
+   BUDGET WARNING just proved inert, and a click guard that returns an error is counted by
+   browser-use as consecutive failures while `repeated_action` reads emitted actions. The
+   only thing that broke a copy in this batch was a grammar change, so the fix layer is a
+   step hook that rebuilds the action model without `click` after k identical clicks on an
+   unchanged URL and screenshot — next session, after widening `short_url` in the trace and
+   adding a `clicked_unlabelled_element` detector (it fired 9–10× per frozen rep and has no
+   counter).
+
+8. **The batch leaves the last task's Chrome running.** `tools/test.py`'s end-of-run `finally`
+   releases the lock and nothing stops `browsin-chrome.service`; pid 276169 (from
+   `wiki-absent-section` rep3) was still active after exit 0. Self-healing — the next run's
+   `_fresh_chrome` stops the unit before starting — but the copy-profile Chrome sits on the
+   desktop until then. One `B.stop()` at the end of the loop. (Stopping it by hand from this
+   session was refused by the permission classifier, so it was left as found.)
+
+9. **Residual gap of `enforce-read-only`, to be watched rather than assumed away:**
+   `send_keys`, `navigate`, `search` and `go_back` stay registered — zero uses in ten Hacker
+   News runs across both batches, but the "report" urge has to go somewhere, and `empty_action`
+   already fires at step 1 on `hn-top-story` 3/3. Guard the 8 v 8 on `empty_action`,
+   `malformed_action` and `budget_exhausted` not rising. And `had_then_lost → 0` is partly by
+   construction under the arm — `grade.py`'s `own_text()` counts typed text as "held", so a
+   run whose only "had" was the typed echo cannot fire it once `input` is gone; the claim
+   counters are correct k/n, `done_only_when_forced` and `steps_after_first_seen`, with
+   `first_seen_step` non-null (the name in `memory`) as the guard.
+
+Open, in order of value, each card-holding step in the background and one at a time:
+(1) the DOM-ready wait in `_drive`, then `run --only hn-top-story --only hn-15th-story --reps 4
+--label probe-domready` (~6 min; pass = `blank_first_state` 8/8 → 0/8, step-1 `empty_action`
+→ 0, no other counter up); (2) the queued 8 v 8, `run --only hn-top-story --only hn-15th-story
+--reps 8 --arms default,enforce-read-only --label ab-enforce` (~25 min) and `compare` — a rate
+claim at `hn-top-story`'s ~2/3 default is not expected, so plan for mechanism-only (rule 8b);
+(3) the regression table `run --reps 3 --arms default,enforce-read-only`, honesty canary must
+stay 3/3; (4) land — read-only tasks exclude `input` and `click` by default, flip
+`wiki-scroll-deep`'s flag and relabel the two run dirs with `test.py diagnose`,
+`stuck_narrative` into `NOT_A_TARGET`, `self-check` green; (5) the no-arm table against landed
+code, verbatim into this section. That is three landed changes, rule 8d's session cap; the
+scroll clamp, the search-box grammar guard and the two new detectors wait for the next one.
+
+**2026-09-05, later — the first task on a client-rendered site ends at step 1.
+`blank_first_state` is not cosmetic; on an SPA it is terminal. And the setting that looks
+like its fix is never read.** Owner-driven read-only probe against `x.com/OpenAI`,
+`--max-steps 14`, `runs/test-one-20260905-095216`:
+
+```
+[one rep1] UNGRADED 1st 8.3s waste=0 -> 'The page is empty, and there are no posts about
+                                         the new Astra model available.'
+  ended_by : done at step 1/14   8.3 s
+  gpu      : 1 calls  median 7.7 s  max 7.7 s  runaway 0  slow 0  aborted 0
+  patterns : blank_first_state(reaction=['done'])
+  prompt tokens per call: [7608]   images per call: [1]   served window: 32768
+```
+
+**The model was right and the harness was wrong.** `step_1.png` is x.com's boot splash — the
+X glyph on black, nothing else on the page. There were no posts, the model said so, and it
+called `done(success=False)` rather than inventing any. That is the honesty canary passing on
+a site it has never seen, and it must not be written up as a task failure; `UNGRADED` rather
+than `WRONG_ANSWER` is the correct outcome. Total cost of the finding: 8.3 s of card time.
+
+Three things this changes.
+
+1. **`blank_first_state`'s severity is site-class-dependent and its `MECHANISM_TEMPLATES`
+   entry understates it.** On Hacker News — server-rendered — the first state is captured
+   early, the model reacts to an empty page with `empty_action`, and the run recovers; the
+   entry's "TEMPLATE, not a finding" framing is right there, and the 8/8 in the previous
+   entry's open item (1) is that benign form. On a client-rendered SPA the same race is
+   terminal: Chrome paints a splash, the state is captured, and there is no second chance
+   because the reaction is `done` at step 1/14. Same detector, same pattern string, two
+   different verdicts. The template must branch on whether the run survived it — as written
+   it would teach the next reader to ignore the one pattern that killed the run.
+
+2. **`minimum_wait_page_load_time` is a dead setting in 0.13.8 and must not be used to
+   implement open item (1).** Its own `Field(description=…)` reads "Minimum time to wait
+   before capturing page state", it is settable through `BrowserSession.__init__`, and it is
+   **never read**. Exhaustively, five occurrences in the installed package and all five are
+   declarations: `profile.py:680` (the field), `session.py:185/219/325` (three signature
+   parameters), `beta/service.py:953` (an env-var name mapping). Zero read sites.
+   `wait_for_network_idle_page_load_time` is identical. This is §10 correction 1's `**kwargs`
+   trap wearing different clothes — it constructs cleanly, it is *documented* to do precisely
+   what the open item wants, and it does nothing. Anyone who implements the DOM-ready wait by
+   raising it will measure no change and have no error to explain why. The wait has to be a
+   real readiness poll in `_drive` before `agent.run()`, against
+   `session.get_state_as_text()` / `get_browser_state_summary()`, on a timeout.
+
+3. **The model has a `wait` action and did not use it.** `wait` is in the live registry and
+   is absent from `DEFAULT_EXCLUDED_ACTIONS`, so the grammar offered it at step 1 and the
+   model chose `done` instead. `DONE_PROMPTLY_MESSAGE` pushes hard in exactly that direction
+   — "If the answer to the task is already visible on the screen, call the `done` action
+   immediately" — and says nothing about a page that has not finished loading. The harness
+   poll is the primary fix and covers the first state only; a page that blanks *mid-run*
+   (an SPA route change) is not covered by it, so the second half belongs in the system
+   message. These two pull against each other and the tension is real: the same instruction
+   that bought 8 steps → 1 step on Wikipedia is what closed this run at step 1. Whichever
+   wording lands must be re-checked against the Wikipedia step counts, not just against x.com.
+
+A fourth point is a gap rather than a finding: **nothing here could have been graded.** No
+`--expect-from` form covers a social timeline, so even a run that read the posts correctly
+would have printed `UNGRADED`. For the interactive class the owner has asked for — logged in,
+clicking, changing state — truth has to be read back from the page after the run (did the
+Like actually land), which `grade.py`'s three fetchers cannot express. That is the structural
+work, and it is larger than the wait.
+
+This supersedes the previous entry's open list, which was written before the SPA measurement:
+(1) is unchanged in intent but now has a named landmine and a much stronger reason; the rest
+of the ordering stands.

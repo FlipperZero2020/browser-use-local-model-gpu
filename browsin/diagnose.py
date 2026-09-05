@@ -33,11 +33,35 @@ from browsin.grade import (
 	result_texts, step_number, steps, tail_error, wilson,
 )
 
-#: Patterns that are outcomes or counters rather than fixable mechanisms — never the "most
-#: frequent pattern" a NEXT footer should chase. Shared by rollup() and next_footer() so the two
-#: lines of one summary cannot name different things.
+#: Patterns that are outcomes, counters or transport noise rather than fixable mechanisms —
+#: never the "most frequent pattern" a NEXT footer should chase. Shared by rollup() and
+#: next_footer() so the two lines of one summary cannot name different things.
+#:
+#: `stuck_narrative` was added on 2026-09-05 after the NEXT footer of runs/test-run-20260905-052408
+#: nominated it (6 runs, "mostly wiki-scroll-deep"). It was not one pattern. The 6 were a 2/2/2
+#: tie across three tasks — Counter.most_common broke it by insertion order — and three unrelated
+#: mechanisms (PLAN.md §10, "Second run through the finished tool", item 4): wiki-scroll-deep
+#: repeated a harmless "scrolled down 742px to reach the section" confabulation while it was in
+#: fact still scrolling toward it; wiki-search-box froze on nine clicks on an inert magnifier span
+#: after a navigation it never registered; hn-15th-story typed the answer into the page as its way
+#: of reporting. Four of the six graded CORRECT. "Memory did not change for >= 4 steps" is a
+#: symptom shared by loops, terse memories and long correct runs, no arm is or could be mapped to
+#: it, and the footer's own recipe — write the mechanism as one sentence naming the step — cannot
+#: be written for a union of three.
+#: `aborted_llm_calls` goes with it: it is the transport's view of a call that never came back
+#: (CLIENT_ABORTED / UPSTREAM_ERROR / no response), so it fires on a killed batch, a lost lease or
+#: a proxy shutdown as readily as on anything the model did, and the step-level `llm_timeout` is
+#: the same event stated as a mechanism a fix could move — that one stays targetable.
+#:
+#: `invented_element_index` is the third detector the module docstring labels instrumentation and
+#: it deliberately stays OUT of this set. Unlike the other two it names one specific model
+#: behaviour — an index absent from the element list the model was shown — which the history API
+#: makes unambiguous (docs/browser-use-0.13.8-history-api.txt, "the clean 'invented element
+#: index' detector"), and which an arm could plausibly probe. It has never fired in the corpus;
+#: unobserved is not the same as untargetable, and a detector that is allowed to win the footer
+#: is the only reason anyone would look when it finally does.
 NOT_A_TARGET = frozenset({'scroll_pages_gt1', 'done_only_when_forced', 'steps_after_first_seen',
-                          'honest_miss', 'slow_llm_call'})
+                          'honest_miss', 'slow_llm_call', 'stuck_narrative', 'aborted_llm_calls'})
 
 
 # ── small readers ───────────────────────────────────────────────────────────────────────
@@ -49,14 +73,43 @@ def url_nofrag(u: str | None) -> str:
 	return p._replace(fragment='').geturl()
 
 
-def short_url(u: str | None, width: int = 34) -> str:
+#: Width of the URL column in the DIAGNOSIS trace, measured over the 11 distinct URLs the run
+#: corpus has visited. 44 shows every on-site URL in full — the longest is
+#: en.wikipedia.org/wiki/Wreck_of_the_Titanic at 42 — and elides exactly two, the off-site
+#: articles the read-only Hacker News tasks followed (95 and 96 raw characters), which keep
+#: their host and their tail. That puts the nominal trace row at 138 columns; rows whose action
+#: or element label overruns its own column still run wider (158 on the 2026-09-05 batch, as
+#: they already did at 34).
+URL_W = 44
+
+
+def short_url(u: str | None, width: int = URL_W) -> str:
+	"""host + path, elided in the MIDDLE so the tail always survives.
+
+	Truncating the head hid a real finding. At 34 columns /wiki/Ada_Lovelace_Award rendered as
+	'en.wikipedia.org/wiki/Ada_Lovelac…', which reads as the Ada Lovelace article — and
+	/wiki/Ada_Lovelace was itself exactly 34 and rendered in full, so the two sat in one trace
+	looking like the same page. That is how runs/test-run-20260905-052408/wiki-search-box-rep3
+	read as nine clicks on the right article when step 5 had in fact landed on the *Award* page
+	(PLAN.md §10 item 7: "indistinguishable from the right article"): the model was on the wrong
+	page for nine of its fourteen steps and the trace said otherwise. Wikipedia titles, HN item
+	ids and query strings all differ in their last characters, so the tail is the half worth
+	keeping; the host stays because it is the only thing that says which site the step is on.
+	The same call renders the from/to pair of url_changed_on_read_only, where a head truncation
+	could collapse the pair the same way — not observed in the corpus so far, where all three
+	rendered from/to pairs differ in the host.
+	"""
 	if not u:
 		return '-'
 	p = urlsplit(u)
-	s = (p.netloc.removeprefix('www.') + p.path + (('?' + p.query) if p.query else ''))
-	if p.fragment:
-		s += '#' + p.fragment[:12]
-	return s if len(s) <= width else s[:width - 1] + '…'
+	host = p.netloc.removeprefix('www.')
+	rest = p.path + (('?' + p.query) if p.query else '') + (('#' + p.fragment[:12]) if p.fragment else '')
+	if len(host) + len(rest) <= width:
+		return host + rest
+	keep = width - len(host) - 1                    # 1 column for the ellipsis
+	if keep < 8:                                    # pathological host: keep the tail, lose the host
+		return '…' + (host + rest)[1 - width:]
+	return host + '…' + rest[-keep:]
 
 
 PAGE_INFO = re.compile(r'<page_info>\s*([\d.]+) pages above, ([\d.]+) pages below')
@@ -513,7 +566,7 @@ def render(task: Task, rep: int, arm: str, row: dict, found: dict, hist: dict,
 		has = 'YES' if in_held else ('res' if in_res else ('NO ' if expected else '   '))
 		mark = ' ← first seen' if n == first else (' ← LOST' if n == lost else '')
 		err = first_error(h)
-		out.append(f"    {n:>2}  {action_label(name, p):<46} {('→ ' + el) if el else '':<24} {short_url((h.get('state') or {}).get('url')):<34} {viewport(h):<6} {has}{mark}"
+		out.append(f"    {n:>2}  {action_label(name, p):<46} {('→ ' + el) if el else '':<24} {short_url((h.get('state') or {}).get('url')):<{URL_W}} {viewport(h):<6} {has}{mark}"
 		           + (f"   ! {err[:40]}" if err else ''))
 	if found:
 		out.append('  patterns : ' + ' · '.join(fmt_ev(k, v) for k, v in found.items()))
