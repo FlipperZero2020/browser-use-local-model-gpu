@@ -73,21 +73,36 @@ DONE_PROMPTLY_MESSAGE = (
 	"already passed. Before each scroll, check whether the screenshot actually changed "
 	"from the previous step — if it looks identical, you scrolled the wrong direction or "
 	"hit the end of the page, and should try the opposite direction or increase pages.\n\n"
-	"When searching for something that is not yet visible and could be far down a long "
-	"page, use a large pages value (3 to 5) per scroll to cover ground quickly, rather "
-	"than the default 1.0 — one page at a time is far too slow to reach content that is "
-	"many screens away. Only switch to smaller scrolls (0.5 to 1.0) once you can see you "
-	"are getting close to the target, so you do not overshoot past it."
+	"Do not go looking for things by scrolling. If you need content that is not on screen, "
+	"first call `search_page` with a distinctive word from what you want: it searches the "
+	"whole page text instantly and for free, including the parts you cannot see. If it finds "
+	"the text, call `find_text` with that text to jump straight there. If it does not find "
+	"the text, the content is not on this page at all and scrolling will never reveal it — "
+	"go back or try a different link.\n\n"
+	"Use `scroll` only to read through a page in order. `pages=1` moves one screen, "
+	"`pages=0.5` half a screen, and `pages=10` goes all the way to the end. If a scroll "
+	"tells you the page did not move, you are at the end of the page: do not scroll that "
+	"way again."
 )
-#: 2026-09-05 caveat on the paragraph above: the one passing run measured so far never
-#: actually sent `pages>1.0` — it stuck to the 1.0 default throughout and still reached a
-#: target ~12.8k px down a real page (measured via a live DOM query) in 7 scrolls, likely
-#: because the real (wide) Chrome viewport reflows to a shorter page than the 1280px-wide
-#: measurement used to estimate that figure. The instruction is kept because it is harmless
-#: if ignored and plausibly helps on a page too long for even a correct-direction, right-sized
-#: scroll to reach in a normal step budget — but it has not yet been the deciding factor in
-#: any observed run. Do not cite it as a confirmed fix; re-test if scroll-speed problems
-#: persist on a page long enough to force the model to actually raise `pages`.
+#: 2026-09-05, third revision of the scroll paragraph — the previous one was WRONG about the
+#: library and inert in practice, and both halves are worth recording so it is not reinvented:
+#:
+#: * It told the model to "use a large pages value (3 to 5)". That is not browser-use's
+#:   vocabulary. `ScrollAction.pages` is documented as '0.5=half page, 1=full page, 10=to
+#:   bottom/top', and the scroll action's own description says "High pages (10) reaches
+#:   bottom" — verified identical in the installed 0.13.8 and in upstream main on GitHub.
+#:   3-5 was an invented middle ground; 10 is the documented "go to the end" value.
+#: * It was inert anyway: across three separate runs the model never once sent `pages>1`
+#:   (`scroll_pages_gt1` k=0 over n=5, n=23 and n=20 scrolls).
+#: * Worse, it pushed *toward* scrolling, against browser-use's own system prompt, which
+#:   already says "Prefer search_page over scrolling when looking for specific text content
+#:   not visible in browser_state" (system_prompts/system_prompt.md:83).
+#:
+#: The replacement points at `search_page`/`find_text` first and states the real `pages`
+#: semantics. Note what it does NOT try to do: it does not tell the model to stop repeating
+#: itself. Three separate attempts to fix the repeat loop with words all failed (see
+#: REPEAT_FEEDBACK_ENABLED below for the measurements), so that job belongs to the tools
+#: layer, not to this string.
 
 #: The overrides PLAN.md §4.3 argues for, with the library default each one replaces.
 #: Not applied automatically by `checked_agent` — it only validates — but `build_agent`
@@ -292,7 +307,185 @@ def build_session(*, cdp_url: str, downloads_path: str):
 	)
 
 
-def build_tools(exclude: tuple[str, ...] = DEFAULT_EXCLUDED_ACTIONS):
+# ── Making a no-op action say so, in the result the model reads ───────────────────
+
+#: 2026-09-05. Four runs on one task (ncbi myncbi, scroll-heavy) established that this model
+#: repeats any action whose result reads as success, and that no amount of *advice* stops it:
+#:
+#: * browser-use's own system prompt already says it in five places — "NEVER repeat the same
+#:   failing action more than 2-3 times" (system_prompt.md:250), "Prefer search_page over
+#:   scrolling when looking for specific text content" (:83), "Detect and break out of
+#:   unproductive loops" (:99), "If stuck in a loop ... change strategy" (:268). Ignored.
+#: * `loop_detection_enabled=True` injects an escalating nudge as a context message. Measured:
+#:   19 nudges in one run, escalating to repetition=20 / stagnation=22, and the model issued
+#:   the identical `scroll` after every single one. Ignored 19/19.
+#: * An `extend_system_message` stating the rule as a hard prohibition, plus pointing at
+#:   `search_page`/`find_text`, moved the loop from `scroll` to `search_page` (n=4) and then
+#:   back to `scroll` at pages=0.5, twenty times. Ignored.
+#:
+#: The common cause is not disobedience. Every one of those rules is conditioned on the model
+#: recognising that an action *failed* — and `scroll` reports success unconditionally. It
+#: returns "Scrolled down 742px" whether the page moved 742px or not one pixel, because it
+#: never compares position before and after: it dispatches a ScrollEvent and then formats the
+#: message from the *requested* amount (browser_use/tools/service.py, the scroll action). The
+#: model is correctly obeying "do not repeat a failing action". It has never been told the
+#: action failed.
+#:
+#: So the feedback belongs on the `ActionResult` the model reads, not in advice alongside it.
+#: This wrapper adds two things and changes nothing else:
+#:
+#:   1. `scroll` that did not move the page says so, with the measured position.
+#:   2. Any action repeated with identical arguments says so, with the count.
+#:
+#: It is deliberately at the tools layer rather than in the prompt, because the prompt layer
+#: is exactly what has already been measured not to work three separate ways.
+REPEAT_FEEDBACK_ENABLED = True
+
+#: `done` is terminal and `screenshot` is legitimately repeatable; neither is wrapped.
+_NO_FEEDBACK_ACTIONS = frozenset({'done', 'screenshot'})
+
+
+async def _scroll_metrics(browser_session) -> tuple[int, int, int] | None:
+	"""(scroll_y, content_height, viewport_height) in CSS px, or None if unavailable.
+
+	Read from CDP `Page.getLayoutMetrics` rather than by evaluating JavaScript: the `evaluate`
+	action is excluded from this agent on purpose (DEFAULT_EXCLUDED_ACTIONS) and reaching for
+	Runtime.evaluate here would quietly reintroduce the same capability on the owner's live
+	browser. getLayoutMetrics is also what the library's own scroll uses for viewport height.
+	"""
+	try:
+		cdp = await browser_session.get_or_create_cdp_session()
+		m = await cdp.cdp_client.send.Page.getLayoutMetrics(session_id=cdp.session_id)
+	except Exception:
+		return None
+	vis = m.get('cssVisualViewport') or {}
+	lay = m.get('cssLayoutViewport') or {}
+	content = m.get('cssContentSize') or {}
+	y = vis.get('pageY')
+	if y is None:
+		y = lay.get('pageY')
+	height = vis.get('clientHeight') or lay.get('clientHeight')
+	try:
+		return (round(float(y or 0)), round(float(content.get('height') or 0)), round(float(height or 0)))
+	except (TypeError, ValueError):
+		return None
+
+
+def _action_key(name: str, params) -> str:
+	"""A stable identity for "the same action with the same arguments"."""
+	body = ''
+	try:
+		if hasattr(params, 'model_dump'):
+			body = repr(sorted(params.model_dump(exclude_none=True).items()))
+		elif params is not None:
+			body = repr(params)
+	except Exception:
+		body = repr(params)
+	return f'{name}|{body}'
+
+
+def _annotate(result, note: str):
+	"""Prepend `note` to the fields the model actually reads back on the next step.
+
+	Both fields, because which one survives into the next prompt depends on whether the action
+	set `long_term_memory`: `extracted_content` is only promoted when `long_term_memory` is
+	absent (see ActionResult's own comments). Prepended, not appended — the tail of a long
+	action result is the easiest part for a small model to skim past.
+	"""
+	if result is None or getattr(result, 'error', None):
+		return result  # a real error already tells the model something went wrong
+	update = {}
+	old_ltm = getattr(result, 'long_term_memory', None)
+	if old_ltm:
+		update['long_term_memory'] = f'{note} (What the tool reported: {old_ltm})'
+	else:
+		update['long_term_memory'] = note
+	old_ec = getattr(result, 'extracted_content', None)
+	if old_ec:
+		update['extracted_content'] = f'{note}\n\n{old_ec}'
+	try:
+		return result.model_copy(update=update)
+	except Exception:
+		return result
+
+
+def wrap_repeat_feedback(tools):
+	"""Make every action report a no-op or a repeat *in its own result*. Returns `tools`.
+
+	The registry calls actions as `action.function(params=validated, **special_context)` and
+	normalises every function to keyword-only (`registry/service.py`), so a wrapper taking
+	`(params=None, **kw)` is safe without preserving any signature — nothing introspects the
+	function at call time.
+	"""
+	state: dict[str, Any] = {'key': None, 'streak': 0}
+	actions = tools.registry.registry.actions
+
+	for name, action in actions.items():
+		if name in _NO_FEEDBACK_ACTIONS:
+			continue
+		action.function = _make_feedback_wrapper(name, action.function, state)
+	return tools
+
+
+def _make_feedback_wrapper(name: str, fn, state: dict):
+	async def wrapped(params=None, **kw):
+		session = kw.get('browser_session')
+		before = await _scroll_metrics(session) if (name == 'scroll' and session is not None) else None
+
+		result = await fn(params=params, **kw)
+
+		notes: list[str] = []
+
+		if before is not None:
+			after = await _scroll_metrics(session)
+			if after is not None and after[0] == before[0]:
+				y, content_h, view_h = after
+				at_bottom = content_h and (y + view_h) >= (content_h - 2)
+				where = 'the BOTTOM' if at_bottom else ('the TOP' if y <= 0 else 'a scroll limit')
+				notes.append(
+					f'THE SCROLL DID NOTHING. The page did not move: it is still at {y}px of '
+					f'{content_h}px total content. You are already at {where} of this page. '
+					f'Scrolling in this direction again is guaranteed to do nothing at all. '
+					f'Whatever you are looking for is NOT further in this direction, so stop '
+					f'scrolling and do something else: use search_page to check whether the text '
+					f'is on this page at all, click a different element, or call go_back.'
+				)
+
+		key = _action_key(name, params)
+		if key == state['key']:
+			state['streak'] += 1
+			n = state['streak'] + 1
+			if n >= 2:
+				# Escalates at 3. Measured 2026-09-05 on the myncbi repro with click/input stripped:
+				# the n>=2 wording alone moved the loop off `scroll` (10.5 -> 2.0 scrolls per run)
+				# but the model then repeated `search_page` 9 times and only called `done` at the
+				# budget ceiling, *having already established the correct answer*. Telling it to
+				# stop is not enough; it has to be told that what it already knows is sufficient.
+				tail = (
+					'You MUST choose a different action now — a different tool, or different '
+					'arguments.' if n < 3 else
+					'STOP. You already have everything this page can tell you. Call `done` NOW '
+					'and report what you found — including, if that is the answer, that the thing '
+					'you were looking for is not on this page. Reporting an honest negative is a '
+					'correct and complete answer; repeating this action is not.'
+				)
+				notes.append(
+					f'REPEATED ACTION: you have now called `{name}` with exactly the same '
+					f'arguments {n} times in a row and received the same result every time. '
+					f'It is not working and it will not start working. {tail}'
+				)
+		else:
+			state['key'] = key
+			state['streak'] = 0
+
+		if notes:
+			result = _annotate(result, ' '.join(notes))
+		return result
+
+	return wrapped
+
+
+def build_tools(exclude: tuple[str, ...] = DEFAULT_EXCLUDED_ACTIONS, repeat_feedback: bool | None = None):
 	"""`Tools` with `exclude` removed — and an error if any name was not actually there.
 
 	`Registry.exclude_action` appends an unknown name and only logs, at DEBUG, when it
@@ -315,6 +508,10 @@ def build_tools(exclude: tuple[str, ...] = DEFAULT_EXCLUDED_ACTIONS):
 	still = sorted(set(exclude) & left)
 	if still:
 		raise ValueError(f'exclusion did not take for {still}')
+	# `None` means "use the project default"; the `no-repeat-feedback` arm passes False so the
+	# control and the fix can be interleaved inside one batch, under the same page state.
+	if REPEAT_FEEDBACK_ENABLED if repeat_feedback is None else repeat_feedback:
+		wrap_repeat_feedback(tools)
 	return tools
 
 

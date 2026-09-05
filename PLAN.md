@@ -2406,6 +2406,103 @@ measurement, not by another prompt draft.
 
 ---
 
+### The repeat loop, and why three prompt-level fixes all failed — 2026-09-05
+
+**Symptom.** On `ncbi.nlm.nih.gov/myncbi/` with a multi-step task, the model issues the same
+action over and over on a page that is not changing. Measured across the first four runs: 5, 18,
+23 and 20 consecutive identical `scroll` actions, all with the page already at BOTTOM.
+
+**Root cause, read from the library, not inferred.** `scroll` reports success unconditionally.
+It dispatches a `ScrollEvent` and then formats its message from the *requested* amount — it never
+compares scroll position before and after (`browser_use/tools/service.py`, the scroll action;
+the string is built from `viewport_height`/`params.pages`). So a scroll that moved the page zero
+pixels returns the identical `Scrolled down 742px` as one that worked.
+
+That single fact explains why every advisory fix fails. **Every anti-loop rule in the stack is
+conditioned on the model recognising that an action failed**, and the tool tells it the action
+succeeded. The model is not disobeying; it has never been told anything went wrong.
+
+**Three prompt-level fixes, all measured, all failed:**
+
+| attempt | result |
+| --- | --- |
+| `--max-steps` 8 -> 25 | 18 identical scrolls instead of 5; had to be killed by hand |
+| `loop_detection_enabled=True` (library default, this project turns it off) | 19 nudges injected, escalating to `repetition=20 / stagnation=22`. The model issued the identical `scroll` after **every one**. Ignored 19/19 |
+| `extend_system_message` stating the rule as a hard prohibition, plus pointing at `search_page`/`find_text` | loop moved from `scroll` to `search_page` (n=4), then back to `scroll` at `pages=0.5`, 20 times |
+
+browser-use's own system prompt already says all of it in five places — "NEVER repeat the same
+failing action more than 2-3 times" (`system_prompts/system_prompt.md:250`), "Prefer search_page
+over scrolling when looking for specific text content not visible" (`:83`), "Detect and break out
+of unproductive loops" (`:99`), "If stuck in a loop ... change strategy" (`:268`). All ignored.
+
+**The fix: put the feedback on the `ActionResult`, not alongside it.**
+`browsin.agent.wrap_repeat_feedback` (behind `REPEAT_FEEDBACK_ENABLED`, applied in `build_tools`)
+wraps every action except `done`/`screenshot` and adds two things to the result the model reads
+back: a `scroll` that did not move the page says so with the measured position (via CDP
+`Page.getLayoutMetrics`, deliberately not `Runtime.evaluate` — `evaluate` is excluded from this
+agent on purpose), and any action repeated with identical arguments says so with the count.
+
+**Measured, 3 reps per arm, interleaved in one batch under the same page state.** Harness: the
+original task on `/myncbi/` with `click`/`input` stripped (`enforce-read-only`), so the model can
+only scroll and cannot touch the owner's live account. `runs/test-one-20260905-144334`:
+
+| arm | scrolls/run | outcome |
+| --- | --- | --- |
+| control (`enforce-read-only+no-repeat-feedback`) | 10, 11, 11 | scroll narration; one run navigated off-page and returned an **empty** answer |
+| fix (`enforce-read-only`) | 2, 2, 2 | switches to `search_page`, correctly concludes the section is not there |
+
+Scrolling per run: **10.7 -> 2.0**. The scroll loop is effectively gone.
+
+**What is NOT fixed.** The loop *moves* rather than disappearing: the fix arm then repeated
+`search_page` 9 times and only called `done` at the budget ceiling. Escalating the repeat note at
+n>=3 to "STOP, call `done` NOW, an honest negative is a correct answer" reduced that to 6-7
+repeats and got one run of three to stop early (9/12) — a real but partial improvement, n=3.
+Final config (corrected scroll paragraph + escalating note, `runs/test-one-20260905-144839`):
+scrolls 2/0/2, done at 12/9/10 of 12. Do not describe this as solved.
+
+**Two separate "giving up" mechanisms, distinct from the loop — verified in source.** The owner's
+original complaint ("it gives up") had a second cause that has nothing to do with repetition:
+
+* `_inject_budget_warning` (`agent/service.py:1536`) fires at a **hard-coded** `budget_ratio >= 0.75`
+  and appends a UserMessage ending "Partial results are far more valuable than exhausting all steps
+  with nothing saved." There is no parameter for the threshold; `max_steps` is the only lever. At
+  `max_steps=8` this fires on steps 6 and 7 — **three of eight steps run under an instruction to
+  wrap up and settle.** Do not run this agent at a budget of 8 and then call the result a model
+  failure.
+* `_force_done_after_last_step` (`agent/service.py:1562`) does two things at the last step: it
+  injects "You reached max_steps - this is your last step. Your only tool available is the done
+  tool", and it swaps the structured-output schema — `self.AgentOutput = self.DoneAgentOutput`. The
+  model therefore *cannot* emit any other action; the grammar has one verb. The same message says
+  "If the task is not yet fully finished as requested by the user, set success in done to false".
+  That is where the first run's final text came from almost verbatim: "The task is not yet fully
+  finished as the API Key Management section has not been located." It is a forced, scripted
+  surrender, not the model deciding to quit — which is exactly what `done_only_when_forced` detects.
+
+**Also corrected here: the scroll paragraph in `DONE_PROMPTLY_MESSAGE` had drifted from the
+library.** It told the model to "use a large pages value (3 to 5)". `ScrollAction.pages` is
+documented as `0.5=half page, 1=full page, 10=to bottom/top`, and the action description says
+"High pages (10) reaches bottom" — verified identical in the installed 0.13.8 and upstream `main`
+on GitHub. 3-5 was invented. It was also inert (`scroll_pages_gt1` k=0 across n=5, 23 and 20
+scrolls) and pushed *toward* scrolling, against the base prompt's own "prefer search_page".
+
+**New test infrastructure.** `tools/test.py` gains the `no-repeat-feedback` arm (the null control
+for the above) and `+`-composable arms, so a control can differ from its treatment in exactly one
+respect while both share a third — `enforce-read-only+no-repeat-feedback` is the case it exists
+for. `self-check` covers both: 123 of 123.
+
+**Two harnesses that do NOT reproduce the loop, recorded so they are not tried again.**
+`wiki-absent-section` (6/6 correct in 1-2 steps, zero scrolls) and starting the model *on* the
+static NCBI 404 with a task that explicitly permits "say it is not here" (6/6 correct in 1 step).
+The loop needs the model to *arrive* carrying a prior belief that the target exists, from a
+multi-step task framing. A harness where the answer is reachable in one look proves nothing.
+
+**Hazard found the hard way.** A run of the real (not read-only) task on the owner's live NCBI
+account completed the task *and* added a delegate — it clicked "Add delegate" while hunting for
+"Add API Key", typed `example@example.com`, and clicked Save. NCBI emailed that address and the
+row sits on the account "Awaiting confirmation". It also created a real API key, which is now in
+plain text in `runs/test-one-20260905-143305/`. **Do not iterate on a task that writes to a live
+account.** Use `enforce-read-only`, which strips `click` and `input` structurally.
+
 ## 11. Optional and unscheduled — a second arm: Microsoft Fara (screenshot-native)
 
 *Written 2026-09-05, on the owner's question "would this model help, or would changing it mess

@@ -189,7 +189,29 @@ def _slug(s: str) -> str:
 
 
 class Arm:
+	"""One experimental condition. Specs may be joined with `+` to combine them.
+
+	`enforce-read-only+no-repeat-feedback` is the case this exists for: to measure the
+	repeat/no-op feedback on a page where the model loops, the control and the treatment must
+	both have `click`/`input` stripped — otherwise they differ in two respects at once and the
+	comparison says nothing. Combining is a plain left-to-right apply; later parts win on the
+	name, and `overrides` are merged.
+	"""
+
 	def __init__(self, spec: str):
+		if '+' in spec:
+			parts = [x.strip() for x in spec.split('+') if x.strip()]
+			if len(parts) < 2:
+				raise SystemExit(f'REFUSED TO START\n  empty half in combined arm {spec!r}')
+			subs = [Arm(x) for x in parts]
+			self.spec = spec
+			self.name = '+'.join(a.name for a in subs)
+			self.extra_excluded = tuple(dict.fromkeys(x for a in subs for x in a.extra_excluded))
+			self.overrides = {k: v for a in subs for k, v in a.overrides.items()}
+			self.read_only_only = any(a.read_only_only for a in subs)
+			self.dom_ready = all(a.dom_ready for a in subs)
+			self.repeat_feedback = all(a.repeat_feedback for a in subs)
+			return
 		self.spec = spec
 		self.extra_excluded: tuple[str, ...] = ()
 		self.overrides: dict = {}
@@ -200,6 +222,11 @@ class Arm:
 		#: already swings WRONG/CORRECT/WRONG/CORRECT/CORRECT across the 2026-09-05 baseline, so a
 		#: cross-batch before/after cannot separate the wait from the front page changing.
 		self.dom_ready = True
+		#: Whether the tools layer tells the model, in the ActionResult it reads, that an action
+		#: was a no-op or an exact repeat (browsin.agent.wrap_repeat_feedback). An ARM for the
+		#: same reason `dom_ready` is one: the loop it targets is intermittent (4 of 5 runs on
+		#: 2026-09-05), so a cross-batch before/after cannot separate the fix from the sampling.
+		self.repeat_feedback = True
 		if spec == 'default':
 			self.name = 'default'
 		elif spec == 'no-dom-ready':
@@ -207,6 +234,10 @@ class Arm:
 			# respect, including the excluded actions and every Agent kwarg.
 			self.name = 'no-dom-ready'
 			self.dom_ready = False
+		elif spec == 'no-repeat-feedback':
+			# The null control for the repeat/no-op feedback: identical to `default` otherwise.
+			self.name = 'no-repeat-feedback'
+			self.repeat_feedback = False
 		elif spec == 'enforce-read-only':
 			self.name = 'enforce-read-only'
 			self.extra_excluded = ('input', 'click')
@@ -232,7 +263,7 @@ class Arm:
 			self.name = 'set-' + _slug(f'{k}-{v}')
 		else:
 			raise SystemExit(f'REFUSED TO START\n  unknown arm {spec!r}; use default | no-dom-ready | '
-			                 f'enforce-read-only | sysmsg:PATH | set:KEY=JSON')
+			                 f'no-repeat-feedback | enforce-read-only | sysmsg:PATH | set:KEY=JSON')
 
 	def applies_to(self, task: G.Task) -> bool:
 		return not self.read_only_only or task.read_only
@@ -575,7 +606,8 @@ async def _drive(task: G.Task, arm: Arm, *, proxy, chrome, scratch, run_dir, max
 	exclude = DEFAULT_EXCLUDED_ACTIONS + (arm.extra_excluded if arm.applies_to(task) else ())
 	llm = build_llm(host=proxy.url, model=MODEL_TAG, num_ctx=NUM_CTX)
 	session = build_session(cdp_url=chrome.cdp_url, downloads_path=str(scratch / 'downloads'))
-	agent = build_agent(task=task.prompt, llm=llm, browser_session=session, tools=build_tools(exclude),
+	agent = build_agent(task=task.prompt, llm=llm, browser_session=session,
+	                    tools=build_tools(exclude, repeat_feedback=arm.repeat_feedback),
 	                    save_conversation_path=str(run_dir / 'conversation'), **arm.overrides)
 	await session.start()
 	try:
@@ -1396,6 +1428,17 @@ def cmd_self_check(_args) -> int:
 	ok('Arm refuses an unknown spec', _raises(lambda: Arm('bogus'), SystemExit))
 	ok('set: arm names are slugs safe for a directory', Arm('set:foo=a/b').name == 'set-foo-a-b' and Arm('set:max_history_items=4').overrides == {'max_history_items': 4})
 	ok('enforce-read-only is inert on a non-read-only task', not Arm('enforce-read-only').applies_to(FREE) and Arm('enforce-read-only').applies_to(RO))
+	ok('arms combine with +',
+	   Arm('enforce-read-only+no-repeat-feedback').extra_excluded == ('input', 'click')
+	   and not Arm('enforce-read-only+no-repeat-feedback').repeat_feedback
+	   and Arm('enforce-read-only+no-repeat-feedback').read_only_only
+	   and Arm('enforce-read-only+no-repeat-feedback').name == 'enforce-read-only+no-repeat-feedback')
+	ok('a combined arm still rejects an unknown half', _raises(lambda: Arm('enforce-read-only+bogus'), SystemExit))
+	ok('no-repeat-feedback is a pure control',
+	   Arm('default').repeat_feedback and Arm('enforce-read-only').repeat_feedback
+	   and not Arm('no-repeat-feedback').repeat_feedback
+	   and Arm('no-repeat-feedback').overrides == {} and Arm('no-repeat-feedback').extra_excluded == ()
+	   and Arm('no-repeat-feedback').dom_ready)
 
 	print('== statistics')
 	lo, hi = G.wilson(1, 3)
@@ -1789,7 +1832,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 	def leasing(p):
 		p.add_argument('--arms', default='default',
-		               help='comma list: default | no-dom-ready | enforce-read-only | sysmsg:PATH | set:KEY=JSON '
+		               help='comma list: default | no-dom-ready | no-repeat-feedback | enforce-read-only | sysmsg:PATH | set:KEY=JSON '
 		                    '(default: %(default)s)')
 		p.add_argument('--label', default='', help='free text recorded in run.json and the lease reason')
 		p.add_argument('--evict', action='store_true',
