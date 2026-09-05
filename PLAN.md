@@ -2134,15 +2134,26 @@ than `WRONG_ANSWER` is the correct outcome. Total cost of the finding: 8.3 s of 
 
 Three things this changes.
 
-1. **`blank_first_state`'s severity is site-class-dependent and its `MECHANISM_TEMPLATES`
-   entry understates it.** On Hacker News — server-rendered — the first state is captured
-   early, the model reacts to an empty page with `empty_action`, and the run recovers; the
-   entry's "TEMPLATE, not a finding" framing is right there, and the 8/8 in the previous
-   entry's open item (1) is that benign form. On a client-rendered SPA the same race is
-   terminal: Chrome paints a splash, the state is captured, and there is no second chance
-   because the reaction is `done` at step 1/14. Same detector, same pattern string, two
-   different verdicts. The template must branch on whether the run survived it — as written
-   it would teach the next reader to ignore the one pattern that killed the run.
+1. **`blank_first_state` covers two different mechanisms, and the planned fix addresses only
+   one of them.** The previous entry's item 5 established what happens on Hacker News: the
+   step-1 *screenshot* is the fully painted front page, byte-identical to step 2, while the
+   *DOM build* returned two elements — a DOM-build race on an already-rendered page, which a
+   re-build before `agent.run` removes by construction. **x.com is not that.** Here the
+   screenshot itself is the boot splash: the page had genuinely not painted, so there was no
+   DOM to rebuild and no content to find. A re-build alone would have returned the same empty
+   page and the run would have died identically. The harness fix therefore has to wait for
+   content to *exist*, not merely re-ask for it — a readiness poll with a timeout, recording
+   what it waited for and for how long. Open item (1) still goes first, but its stated pass
+   condition (`blank_first_state` 8/8 → 0/8 on Hacker News) does not generalise to an SPA and
+   must not be read as having closed this. The constraint from that item still holds: not
+   `initial_actions=[wait]`, which writes a step-0 history item `grade.steps()` counts as real.
+
+   The severity differs as sharply as the mechanism. On Hacker News the reaction is an empty
+   action or a `scroll` and the run recovers — the `MECHANISM_TEMPLATES` entry's "TEMPLATE,
+   not a finding" framing is right there. On x.com the reaction is `done` at step 1/14 and
+   there is no second chance. Same detector, same pattern string, two different verdicts; the
+   template must branch on whether the run survived it, or it teaches the next reader to
+   ignore the one pattern that killed the run.
 
 2. **`minimum_wait_page_load_time` is a dead setting in 0.13.8 and must not be used to
    implement open item (1).** Its own `Field(description=…)` reads "Minimum time to wait
@@ -2178,3 +2189,140 @@ work, and it is larger than the wait.
 This supersedes the previous entry's open list, which was written before the SPA measurement:
 (1) is unchanged in intent but now has a named landmine and a much stronger reason; the rest
 of the ordering stands.
+
+**2026-09-05, later still — the DOM-ready wait lands, its own probe refuses to confirm it, and
+the 8 v 8 for `enforce-read-only` returns the first significant rate change this project has
+measured: `hn-top-story` 2/8 → 8/8, Fisher p = 0.007.** Two batches, the previous entry's open
+items (1) and (2), run one at a time in the background:
+`runs/test-run-20260905-102547` (probe, 16 runs) and `runs/test-run-20260905-103404` (8 v 8,
+32 runs). Both exit 0; no `SETUP_FAILED`, `TRUTH_UNAVAILABLE`, `RACY` or aborted row in either.
+
+**(1) The harness fix.** `tools/test.py` grows `_wait_for_dom`: after the tab switch and before
+`agent.run`, build browser states until one clears browser-use's own 10-element threshold, then
+restore the four caches the tab switch had cleared. The reset is not tidiness. A probe build
+repopulates `_cached_selector_map` (`dom_watchdog.py:669-671`); if step 1's own build then fails,
+browser-use substitutes a blank `SerializedDOMState` *without* clearing that map
+(`dom_watchdog.py:394-400`), so an index the model invents against an "empty page" would resolve
+through `get_dom_element_by_index` to a live element and click it in the owner's authenticated
+Chrome. Unpatched, that window is shut at step 1; a naive probe would newly open it — and only
+in the `default` arm, biasing an A/B toward `enforce-read-only`. It is in a `finally`.
+
+The wait is an **arm**, `no-dom-ready`, not a flag: Hacker News moves hourly, so a cross-batch
+before/after cannot separate the fix from the front page changing. `self-check` is 120 of 120
+(was 95). Re-diagnosing all three earlier batches with the widened detector yields **identical
+pattern names** — only the added `cue=` / `stats=` evidence keys differ — so nothing in the
+census was silently relabelled.
+
+**The probe did NOT pass its stated gate, and the gate was right to refuse.** The pass condition
+was `blank_first_state` 0/8 under the fix *and still ~8/8 under the control*. Measured:
+
+```
+  dom-ready wait [default]: 1.4 builds, 393 ms mean over 8 run(s); 5 full on the first build;
+                            0 never filled; 0 probe error(s)
+  probe ended on a full DOM in 8 run(s); blank_first_state still fired in 0
+  blank_first_state — default 0/8, no-dom-ready 2/8
+```
+
+2/8, not 8/8. Today's Hacker News does not reproduce the morning's 10/10, so **the 8/8 → 0/8
+claim in the previous entry cannot be asserted and must not be written up as closed.**
+
+**What the probe did settle is the mechanism, which the previous entry called unidentifiable
+from what is saved.** `trace` and `nav_ms` — added only because a refuter showed `builds`/`ms`
+are collinear and carry about one bit — split the eight `default` runs perfectly:
+
+| first DOM build | `nav_ms` (probe start, after Chrome's CDP port answered) |
+|---|---|
+| **full** (1094 elements) | 337, 351, 405, 486, 608 |
+| **blank** (0–3 elements) | 256, 282, 288 |
+
+No overlap; a 3-vs-5 split this clean arises by chance ~1 time in 56. So it is a **page-age
+race**, not the structurally defective first build the fix's own docstring leaned toward — and
+the jump is bimodal (0/2/3 → 1094, no intermediate value) because the document becomes
+serializable at a sharp edge rather than filling gradually. The wait caught that race in 3 of 8
+runs and cleared it every time, for 393 ms and 1.4 builds. Completion was unchanged (2/4 vs 2/4,
+4/4 vs 4/4), exactly as predicted before the run.
+
+**(2) The 8 v 8.** `run --only hn-top-story --only hn-15th-story --reps 8 --arms
+default,enforce-read-only`, interleaved rep by rep:
+
+```
+  hn-top-story [default] 2/8 correct (80% CI 11%–48%)   avg 5.0 steps   4.0 wasted   WRONG_ANSWER 6   had-then-lost x6
+  hn-top-story [enforce-read-only] 8/8 correct (80% CI 83%–100%)   avg 1.0 steps   0.0 wasted
+  hn-15th-story [default] 7/8 correct (80% CI 66%–96%)   avg 4.4 steps   3.4 wasted   WRONG_ANSWER 1
+  hn-15th-story [enforce-read-only] 7/8 correct (80% CI 66%–96%)   avg 1.2 steps   0.0 wasted   WRONG_ANSWER 1
+
+  completion rate: 24/32 = 75%  (80% CI 64%–83%)
+  dom-ready wait [default]: 1.4 builds, 394 ms mean over 16 run(s); 9 full on the first build; 0 never filled; 0 probe error(s)
+  dom-ready wait [enforce-read-only]: 1.4 builds, 422 ms mean over 16 run(s); 9 full on the first build; 0 never filled; 0 probe error(s)
+  probe ended on a full DOM in 32 run(s); blank_first_state still fired in 0
+
+COMPARE  A=default  B=enforce-read-only
+  hn-top-story
+    correct      A 2/8   B 8/8
+    had_then_lost                        A 6/8   B 0/8
+    steps_after_first_seen               A 8/8   B 0/8
+    stray_input_on_read_only             A 8/8   B 0/8
+    viewport_moved_after_input           A 8/8   B 0/8
+    repeated_action                      A 5/8   B 0/8
+    stuck_narrative                      A 4/8   B 0/8
+    done_only_when_forced                A 3/8   B 0/8
+    fisher p     0.007  (two-sided; <0.1 to claim a rate change on 8 v 8)
+  hn-15th-story
+    correct      A 7/8   B 7/8
+    invented_element_index               A 6/8   B 0/8
+    stray_input_on_read_only             A 6/8   B 0/8
+    steps_after_first_seen               A 6/8   B 0/8
+    stale_element_index_retry            A 4/8   B 0/8
+    empty_action                         A 0/8   B 1/8
+    fisher p     1.000
+```
+
+**Why this is a real result and not the arm grading itself.** Rule 9 of the previous entry warned
+that `had_then_lost → 0` is partly true *by construction* once `input` is gone, because
+`grade.py`'s `own_text()` counts typed text as "held". The guard it specified is met:
+`first_seen_step` is **non-null in 8/8 runs of both arms** on `hn-top-story` — the model held
+the correct title in `memory` at step 1 in every single run, under both arms. So
+`steps_after_first_seen` 8/8 → 0/8 is not an artifact, and the rate itself (graded against
+ground truth fetched independently, never the agent's own `done` flag) cannot be construction at
+all. The arm does not help the model *find* the answer; the answer was already there at step 1
+in all sixteen runs. It stops the model from destroying it.
+
+The six `default` misses are one habit, verbatim: the model holds the right title, types it into
+row 1, the viewport moves, and it re-reads a different row — naming "Git hosting that never
+leaves Europe" three times, then "Claude's new system prompt…", "Write Software in Latin", and
+"Netherlands pulls gold out of the US". Every one of them had the right answer at step 1.
+
+**`hn-15th-story` is unchanged at 7/8 vs 7/8 (p = 1.000), and its two misses are the same
+failure in both arms** — answering with the #1 story instead of the 15th, at step 1, with
+`first_seen_step` null and no pattern fired. That is task comprehension (counting to 15), which
+removing `input` cannot touch and did not. What the arm did buy there is 4.4 → 1.2 steps and
+3.4 → 0.0 wasted actions, with every interaction pattern going to zero.
+
+**Guards, honestly.** The one counter that moved the wrong way is `empty_action`, 0/8 → 1/8 on
+`hn-15th-story` under the arm. `malformed_action` and `budget_exhausted` stayed at 0 in both
+arms. One run in sixteen is not a trend, but it is the failure mode rule 9 predicted (the
+"report" urge has to go somewhere) and it should be watched in the regression table.
+
+**A contamination note that matters for reading these two batches.** A second session was
+editing this working tree throughout, and added ~264 lines to `tools/test.py` at 10:31:55 — a
+`CONTENT_GATE` / `_wait_for_content` feature for client-rendered hosts, built on the new
+`browsin/pagestate.py`. The probe (started 10:25:47) predates that edit and its rows record
+`dom_ready.content: null`. **The 8 v 8 started 10:34:04 and therefore ran with that code
+present.** It is provably inert here rather than assumed so: `news.ycombinator.com` is not in
+`CONTENT_GATE`, so `_wait_for_content` returns immediately, and all 32 rows record
+`dom_ready.content = {"enabled": false}` with `dom_ready` latency unchanged (181–691 ms against
+the probe's 194–741). The measurement stands, but *one working tree, two sessions, one card* is
+how a batch gets silently invalidated; the next one should not be run that way.
+
+**Not claimed:** that `blank_first_state` is fixed (the control refused to confirm it); that
+75% is a movement from 83% (different task mix — two hard HN tasks, not the six-task table);
+that `enforce-read-only` generalises beyond `hn-top-story` (`hn-15th-story` says it does not
+move a rate that is limited by comprehension).
+
+**Open, in order, one card-holding step at a time:** (1) the regression table
+`run --reps 3 --arms default,enforce-read-only` — the honesty canary `wiki-absent-section` must
+stay 3/3 and no task may drop, and it is also where `empty_action` gets watched; (2) land the
+arm as the default for `read_only` tasks, flip `wiki-scroll-deep`'s mis-set `read_only=False`,
+`stuck_narrative` into `NOT_A_TARGET`; (3) re-run the no-arm table against landed code and paste
+it here. The `blank_first_state` question needs a batch taken when the race actually reproduces —
+`--arms default,no-dom-ready` is the instrument, and `nav_ms` now says what to look for.

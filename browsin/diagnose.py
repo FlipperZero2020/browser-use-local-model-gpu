@@ -202,6 +202,21 @@ def _pages(params: dict) -> float:
 		return 1.0
 
 
+_PAGE_STATS = re.compile(r'<page_stats>(.*?)</page_stats>', re.S)
+
+
+def page_stats(state_message: str | None) -> str:
+	"""The verbatim <page_stats> line browser-use emitted for a step, whitespace-collapsed, or ''.
+
+	Recorded rather than re-derived because it is the only place the model's view of page
+	readiness is written down: it carries both of browser-use's loading cues and the element
+	counts behind them (agent/prompts.py:225-250). Without it a batch that stops firing
+	`blank_first_state` cannot be told apart from a batch that swapped one cue for the other.
+	"""
+	m = _PAGE_STATS.search(state_message or '')
+	return ' '.join(m.group(1).split()) if m else ''
+
+
 WORD_DOWN = re.compile(r'\bdown\b')
 WORD_UP = re.compile(r'\b(?:up|upward|upwards|back|backward|backwards)\b')
 
@@ -415,12 +430,26 @@ def detect(task: Task, expected: list[str] | None, hist: dict, row: dict,
 		if len(scrolls) >= 6 and gt1 == 0:
 			found['scroll_step_too_small'] = {'n': len(scrolls)}
 
-	# — first state blank on a fresh Chrome (HN captured before render) —
+	# — first state carried a loading cue on a fresh Chrome (measured: Hacker News, 10/10 runs) —
+	#
+	# 'consider waiting' is matched because browser-use has TWO loading cues and they are an
+	# if/elif on one line (agent/prompts.py:230-242): 'Page appears empty - consider waiting - '
+	# below 10 total elements, and 'N network request(s) in flight and little text rendered -
+	# page may still be loading, consider waiting - ' above 20 elements with thin text. While the
+	# DOM was 2 elements the second branch was structurally unreachable; a fix that fills the DOM
+	# unlocks it. Greping only the first wording would let such a fix swap one cue for the other
+	# and read as a clean 0/8 pass. Verified 2026-09-05: the second wording occurs ZERO times in
+	# the 64-run census, so widening is exactly baseline-neutral — every historical run re-reads
+	# the same way (tools/test.py diagnose on an old run dir proves it).
 	if real:
 		sm0 = real[0].get('state_message') or ''
 		m0 = norm(memory(real[0]) + ' ' + eval_text(real[0]))
-		if 'Page appears empty' in sm0 or 'empty page' in sm0 or 'page is empty' in m0 or 'no content' in m0:
-			found['blank_first_state'] = {'reaction': [n for n, _ in actions(real[0])] or ['(no action)']}
+		cue = next((c for c in ('Page appears empty', 'network request(s) in flight',
+		                        'consider waiting', 'empty page') if c in sm0), None)
+		if cue or 'page is empty' in m0 or 'no content' in m0:
+			found['blank_first_state'] = {'reaction': [n for n, _ in actions(real[0])] or ['(no action)'],
+			                              'cue': cue or 'model wording only',
+			                              'stats': page_stats(sm0)[:140] or '-'}
 
 	# — typed the requested query, then never submitted —
 	if not task.read_only:
@@ -483,8 +512,12 @@ MECHANISM_TEMPLATES = {
 	'typed_but_never_submitted': "the query was typed correctly but no click/Enter followed; waiting or "
 	                             "find-in-page cannot make results appear",
 	'budget_exhausted': "ran out of steps with no `done` — read the trace for what it spent them on",
-	'blank_first_state': "the first browser state was captured before the page rendered (fresh Chrome, "
-	                     "Hacker News); the model reacted to an empty page",
+	'blank_first_state': "the first browser state carried browser-use's 'consider waiting' cue — on "
+	                     "Hacker News, 0-3 serialized elements while that same step's screenshot was "
+	                     "the fully painted front page — and the model answered the empty state. It "
+	                     "costs step 1 as a real read; it is NOT by itself the cause of the miss "
+	                     "(the one 2026-09-05 run whose step 1 was full, runs/test-run-20260905-042542, "
+	                     "still WRONG_ANSWERed with had_then_lost)",
 	'runaway_generation': "one LLM call generated to the num_predict cap with malformed JSON; the truncation "
 	                      "is a parse failure the retry clears",
 	'llm_timeout': "an LLM call hit llm_timeout (600 s) and was abandoned; the box kept generating",
@@ -542,6 +575,23 @@ def render(task: Task, rep: int, arm: str, row: dict, found: dict, hist: dict,
 	               for n in (found.get(k, {}).get('steps') or []))
 	out.append(f"  ended_by : {ended} at step {step_number(real[-1]) if real else '-'}/{max_steps}   {row.get('seconds', '?')} s"
 	           + (f"   LLM-failure steps {fails}" if fails else ''))
+	# What the model was told about page readiness at step 1, verbatim, and what the harness paid
+	# before the run to make it true (tools/test.py _wait_for_dom). Both .get-safe: no row written
+	# before 2026-09-05 carries `dom_ready`, and `test.py diagnose` must still render old run dirs.
+	ps0 = page_stats(real[0].get('state_message') if real else '')
+	if ps0:
+		out.append(f'  step1    : <page_stats> {ps0[:140]}')
+	dr = row.get('dom_ready') or {}
+	if dr and not dr.get('enabled', True):
+		out.append('  dom_ready: DISABLED for this arm (control) — no pre-run wait was paid')
+	elif dr:
+		out.append(f"  dom_ready: {dr.get('builds')} build(s), {dr.get('ms')} ms, ending at "
+		           f"{dr.get('elements')} elements / {dr.get('interactive')} interactive"
+		           + (f"   (probe began {dr['nav_ms']} ms after Chrome's CDP port answered)"
+		              if dr.get('nav_ms') is not None else '')
+		           + (f"   trace {dr['trace']}" if dr.get('trace') else '')
+		           + ('   TIMED OUT — ran anyway; this run may still show a loading cue' if dr.get('timed_out') else '')
+		           + (f"   PROBE ERROR {dr['error']} — the wait was a no-op for this run" if dr.get('error') else ''))
 	if proxy_records:
 		el = sorted(r.get('elapsed_s') or 0 for r in proxy_records)
 		med = el[len(el) // 2] if el else 0

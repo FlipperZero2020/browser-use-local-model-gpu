@@ -19,6 +19,8 @@ first in every session. Read CLAUDE.md before touching anything; PLAN.md §10 is
 WHAT ONE RUN PRODUCES
   runs/test-<mode>-<ts>/run.json                     mode, label, reps, arms, task specs, ttl
   runs/test-<mode>-<ts>/results.jsonl                one line per run, appended AS EACH RUN FINISHES
+                                                     incl. dom_ready: what the pre-run wait for a
+                                                     non-empty DOM cost (builds, ms, trace, nav_ms)
   runs/test-<mode>-<ts>/proxy.jsonl                  every LLM call: prompt_eval_count, eval_count, done_reason
   runs/test-<mode>-<ts>/summary.txt                  the per-task table, the ROLLUP and the NEXT footer
   runs/test-<mode>-<ts>/<task>-rep<N>[-<arm>]/history.json    every step, as browser-use saw it
@@ -98,6 +100,15 @@ THE LOOP — run → diagnose → fix as an ARM → measure → land
      `--resume` it. (f) a fix that fails twice for the same reason → stop and report.
 
 ARMS (recorded in every results row; `default` is no override)
+  no-dom-ready        the NULL CONTROL for the pre-run DOM-ready wait: identical to default in
+                      every other respect, but skips `_wait_for_dom` so the agent's own first
+                      build is the first build, as it was before 2026-09-05. Run it as
+                      `--arms default,no-dom-ready` when you want the wait's effect measured
+                      inside ONE batch — Hacker News moves hourly and hn-top-story already
+                      swings across identical baselines, so a cross-batch before/after cannot
+                      separate the wait from the front page changing. Also the escape hatch for
+                      a legitimately sparse page (browsin/fixture.py serializes to < 10 nodes,
+                      so the wait can only time out there).
   enforce-read-only   for tasks marked read_only, remove `input` and `click` from the registry.
                       Every had_then_lost in the corpus begins with a stray `input`;
                       DEFAULT_EXCLUDED_ACTIONS is the precedent — enforcement, not persuasion.
@@ -183,8 +194,19 @@ class Arm:
 		self.extra_excluded: tuple[str, ...] = ()
 		self.overrides: dict = {}
 		self.read_only_only = False
+		#: Whether this arm pays the pre-run DOM-ready wait (`_wait_for_dom`). It is an ARM and not
+		#: a batch flag on purpose: `--arms default,no-dom-ready` interleaves the control with the
+		#: fix inside one batch, under the same page state. Hacker News moves hourly and hn-top-story
+		#: already swings WRONG/CORRECT/WRONG/CORRECT/CORRECT across the 2026-09-05 baseline, so a
+		#: cross-batch before/after cannot separate the wait from the front page changing.
+		self.dom_ready = True
 		if spec == 'default':
 			self.name = 'default'
+		elif spec == 'no-dom-ready':
+			# The null control for the DOM-ready wait: identical to `default` in every other
+			# respect, including the excluded actions and every Agent kwarg.
+			self.name = 'no-dom-ready'
+			self.dom_ready = False
 		elif spec == 'enforce-read-only':
 			self.name = 'enforce-read-only'
 			self.extra_excluded = ('input', 'click')
@@ -209,8 +231,8 @@ class Arm:
 				self.overrides[k] = v
 			self.name = 'set-' + _slug(f'{k}-{v}')
 		else:
-			raise SystemExit(f'REFUSED TO START\n  unknown arm {spec!r}; use default | enforce-read-only | '
-			                 f'sysmsg:PATH | set:KEY=JSON')
+			raise SystemExit(f'REFUSED TO START\n  unknown arm {spec!r}; use default | no-dom-ready | '
+			                 f'enforce-read-only | sysmsg:PATH | set:KEY=JSON')
 
 	def applies_to(self, task: G.Task) -> bool:
 		return not self.read_only_only or task.read_only
@@ -329,8 +351,224 @@ async def _fresh_chrome(B, url: str):
 	return B.start(url)
 
 
-async def _drive(task: G.Task, arm: Arm, *, proxy, chrome, scratch, run_dir, max_steps: int):
-	"""One agent run. Returns (history_dict, seconds, proxy_records_for_this_run)."""
+#: browser-use's threshold, not ours: agent/prompts.py:230 prefixes its <page_stats> line with
+#: 'Page appears empty - consider waiting - ' whenever _extract_page_statistics()['total_elements']
+#: < 10, and that prefix is one of the two cues browsin.diagnose.blank_first_state greps for.
+#: Gating on any other number (len(selector_map), say) could clear a weaker bar while the model
+#: still sees the string. `self-check` pins this against the installed library's own source.
+#:
+#: A page can be legitimately sparser than this: browsin/fixture.py's two pages serialize to well
+#: under 10 nodes, so browser-use prints the same cue on them and the wait below can then only
+#: time out — 8 s and a flag on a perfectly healthy page. Use `--arms no-dom-ready` for those.
+DOM_READY_MIN_ELEMENTS = 10
+
+#: 8 s of polling, not 30. Measured 2026-09-05 on Hacker News: the blank build costs ~0.3 s and
+#: the full one ~0.8 s (step duration minus the summed proxy elapsed_s for that step), and in all
+#: ten blank runs the DOM was full by the very next build — so this is insurance, not the expected
+#: price. Expected cost ~1 s a run; 32 runs at the full cap would be +4 min on a ~23 min batch.
+#:
+#: HONEST BOUND: the deadline is checked only BETWEEN builds, and browser-use gives each build its
+#: own 30 s (BrowserStateRequestEvent.event_timeout, browser/events.py:201), so one pathological
+#: build can carry a single run to ~38 s. Deliberately NOT wrapped in asyncio.wait_for: cancelling
+#: our await does not cancel the handler, and the orphan would later repopulate the very caches
+#: the `finally` below exists to clear. Lease loss needs no help from the cap either — every
+#: statement in the loop is an await, so hold()'s Task.cancel() lands immediately.
+DOM_READY_TIMEOUT_S = 8.0
+
+#: The blank build is fast (~0.3 s), so an immediate re-issue would re-read the same document.
+#: There is deliberately NO sleep before the FIRST build: `builds == 1` has to keep meaning "the
+#: first build was already full", which is half the discrimination this wait buys.
+DOM_READY_POLL_S = 0.3
+
+
+def _dom_elements(dom_state) -> int:
+	"""browser-use's own `total_elements`, recomputed here rather than imported.
+
+	An exact mirror of AgentMessagePrompt._extract_page_statistics (agent/prompts.py:150-221):
+	every node of the SERIALIZED tree — element, text and shadow-root alike — skipping a node and
+	its whole subtree when `original_node` is falsy, and 0 when `_root` is None. It is the number
+	that decides the 'Page appears empty' line, so gating on anything else could clear the gate
+	and still emit the string. Pure and stdlib-only, so `self-check` exercises it against fakes
+	with no card, no browser and no import of browser_use.
+
+	`self-check` pins the THRESHOLD against the installed library but nothing can pin this
+	traversal contract. If upstream renames `_root`, `original_node` or `children` this raises,
+	`_wait_for_dom` records it in `error`, and the wait silently becomes a per-run no-op that
+	still costs one DOM build. The per-run `<< dom-ready PROBE ERROR` line is the only thing that
+	says so — which is why that flag is printed separately from a timeout.
+	"""
+	root = dom_state._root if dom_state is not None else None
+	n, stack = 0, [root]
+	while stack:
+		node = stack.pop()
+		if node is None or not node.original_node:
+			continue
+		n += 1
+		stack.extend(node.children)
+	return n
+
+
+async def _wait_for_dom(session, *, enabled: bool = True, nav_t0: float | None = None,
+                        timeout_s: float = DOM_READY_TIMEOUT_S, poll_s: float = DOM_READY_POLL_S,
+                        min_elements: int = DOM_READY_MIN_ELEMENTS) -> dict:
+	"""Build browser states until one is not the empty-page state, and record what that cost.
+
+	WHAT WAS MEASURED (runs/test-run-20260905-045402, -052408). On Hacker News, 10 of 10 runs had
+	browser-use's FIRST browser-state build return a 0-3 element DOM ('Page appears empty -
+	consider waiting - 0 links, 0 interactive, 0 iframes, 2 total elements') while that same
+	step's SCREENSHOT was the fully painted front page, byte-identical to step 2's; step 2's DOM
+	was 1094 elements every time. 0 of 12 Wikipedia runs did this. The model answered the empty
+	state with a scroll (6), no parseable action (3) or a wait (1).
+
+	WHAT IS NOT CLAIMED. This is NOT "the dominant failure". Of those 10 runs, 8 graded CORRECT
+	and 2 WRONG_ANSWER — and runs/test-run-20260905-042542/hn-top-story-rep1, the one HN run whose
+	step 1 already had the full 1094-element DOM (i.e. the closest thing on disk to a post-fix
+	control), is WRONG_ANSWER with had_then_lost / stray_input_on_read_only /
+	viewport_moved_after_input: the same signature as the dominant failure. So the honest claim is
+	narrow: the blank first state spends step 1 on nothing and makes step 1 unreadable as
+	evidence. Removing it is expected to take blank_first_state to 0 and to leave the completion
+	rate where it is. Predict that in the label, then check it.
+
+	NOT initial_actions=[wait]. That writes a step-0 history item browsin/grade.py's steps()
+	counts as a real step; worse, browser-use builds that item with no state_message, so steps()[0]
+	would carry an empty one, blank_first_state would fall silent on every run, and the real first
+	build would stay exactly as blind — faking the very number this exists to move.
+
+	Returns {'enabled','builds','ms','elements','interactive','trace','nav_ms','timed_out','error'},
+	recorded per run. `trace` is [[ms, elements, interactive], ...] per build and `nav_ms` is how
+	long after Chrome's CDP port answered the probe began: together they are what separates "the
+	first build is structurally defective and one retry clears it" (builds 2, elements jumping
+	2 -> 1094 with no intermediate value) from "the page was still loading" (elements climbing, or
+	a full first build at a later nav_ms). `builds` and `ms` alone are collinear and carry about
+	one bit — that was a real weakness of the first draft of this probe.
+
+	On timeout it PROCEEDS and says so rather than raising SETUP_FAILED. SETUP_FAILED is outside
+	G.GRADED, so it would delete from the rate's denominator exactly the runs most likely to still
+	be blank. A run whose wait timed out is a valid measurement of the unfixed condition, not a
+	harness fault; a genuinely dead CDP session still becomes SETUP_FAILED moments later out of
+	agent.run().
+
+	`except Exception`, never BaseException: browsin.lease delivers lease loss as Task.cancel(), so
+	CancelledError and KeyboardInterrupt must pass straight through. A bug in this probe then costs
+	one recorded field, not 32 runs of a card-holding batch.
+
+	include_screenshot=False: the agent takes its own at step 1 regardless, and skipping it keeps
+	this loop off Page.captureScreenshot and off the remove_highlights() JS that path evaluates in
+	the owner's real page (screenshot_watchdog.py:58-60). No highlights are injected either —
+	dom_highlight_elements defaults False (browser/profile.py:687) and browsin.agent.build_session
+	does not set it — and the DOM build only READS scroll offsets, so the probe cannot move the
+	viewport out from under the model.
+	"""
+	t0 = time.monotonic()
+	st: dict = {'enabled': bool(enabled), 'builds': 0, 'ms': 0, 'elements': 0, 'interactive': 0,
+	            'trace': [], 'nav_ms': None if nav_t0 is None else round((t0 - nav_t0) * 1000),
+	            'timed_out': False, 'error': None}
+	if not enabled:
+		return st
+	try:
+		while True:
+			state = await session.get_browser_state_summary(include_screenshot=False)
+			st['builds'] += 1
+			st['elements'] = _dom_elements(state.dom_state)
+			st['interactive'] = len(state.dom_state.selector_map or {})
+			st['trace'].append([round((time.monotonic() - t0) * 1000), st['elements'], st['interactive']])
+			if st['elements'] >= min_elements:
+				break
+			if time.monotonic() - t0 >= timeout_s:
+				st['timed_out'] = True
+				break
+			await asyncio.sleep(poll_s)
+	except Exception as exc:
+		st['error'] = f'{type(exc).__name__}: {exc}'
+	finally:
+		# Put the session back exactly as the tab switch left it. on_AgentFocusChangedEvent
+		# (browser/session.py:1229-1235) clears FOUR things — the DOM watchdog's cache, the state
+		# summary, the selector map and the selector indices — and a successful probe build
+		# repopulates all four (dom_watchdog.py:669-671 calls update_cached_selector_map).
+		#
+		# The selector map is the one that matters, and it is a SAFETY issue, not tidiness: if
+		# step 1's own DOM build then fails, browser-use substitutes a blank SerializedDOMState
+		# WITHOUT clearing that map (dom_watchdog.py:394-400), so an index the model invents
+		# against an "empty page" would resolve through get_dom_element_by_index
+		# (browser/session.py:2449-2451) to a live element and click it in the owner's
+		# authenticated Chrome. browser-use clears exactly this set on its own blank-state path,
+		# commented 'Clear every action lookup path before calling the model'
+		# (browser/session.py:1631-1635). Unpatched, that window is shut at step 1; the probe
+		# would newly open it, and only in the `default` arm (enforce-read-only has no click or
+		# input to reach it with), which would bias an A/B toward the arm.
+		#
+		# In a `finally` so the exception path is covered too — the advertised graceful
+		# degradation (a `_root` rename) raises AFTER the watchdog has already cached its state.
+		# Each reset is guarded: the cleanup itself must not be able to raise.
+		for reset in (lambda: setattr(session, '_cached_browser_state_summary', None),
+		              lambda: session.update_cached_selector_map({}),
+		              lambda: session._dom_watchdog and session._dom_watchdog.clear_cache()):
+			try:
+				reset()
+			except Exception as exc:
+				st['error'] = st['error'] or f'reset: {type(exc).__name__}: {exc}'
+	st['ms'] = round((time.monotonic() - t0) * 1000)
+	return st
+
+
+#: Hosts whose first paint is CLIENT-rendered, so `_wait_for_dom` above is necessary and NOT
+#: sufficient. Measured 2026-09-05 on x.com: a fresh Chrome launched onto x.com/OpenAI was
+#: screenshotted showing the site's BOOT SPLASH (the X glyph on black), the model correctly
+#: reported an empty page and called done(success=False) at step 1 of 14, and the whole run was
+#: over in 8.3 s (runs/test-one-20260905-095216).
+#:
+#: Why the DOM-element wait cannot cover this. `_wait_for_dom` clears at
+#: DOM_READY_MIN_ELEMENTS=10 total nodes, and a boot splash is a real DOM — an SVG logo inside a
+#: few wrappers sits either side of 10, so the gate is a coin toss on markup this project does
+#: not control. And DOM_READY_TIMEOUT_S is 8.0 s against a page measured at 3,464 ms to
+#: DOMContentLoaded *signed out*, where the signed-in timeline is heavier. Waiting for "some
+#: nodes" is the wrong question on an SPA; the right one is "has the content I asked for
+#: appeared", which is what browsin.pagestate.REQUIRE encodes.
+#:
+#: Keyed by host and not applied everywhere on purpose: on a server-rendered page the predicate
+#: is satisfied by the first poll (measured: 0.03 s, 1 poll) and costs nothing, but a wrong
+#: predicate on a site nobody has measured would burn CONTENT_GATE_TIMEOUT_S per run and flag a
+#: healthy page. Add a host here only with a measurement beside it.
+CONTENT_GATE = {
+	'x.com': 'x-timeline',
+	'twitter.com': 'x-timeline',
+}
+
+#: 30 s, not `_wait_for_dom`'s 8. This waits on a third party's network and JS bundle, not on a
+#: local retry. It is spent only on hosts in CONTENT_GATE, and only until the predicate is true.
+CONTENT_GATE_TIMEOUT_S = 30.0
+
+
+async def _wait_for_content(chrome, host: str) -> dict:
+	"""Wait until the page actually shows what the task is about. Records; never raises.
+
+	Runs over its own raw-CDP connection (`browsin.pagestate`) rather than through browser-use,
+	because the question is about the PAGE and browser-use's answer to it is the very thing
+	measured as unreliable here. A second CDP client on the same target is fine; CDP multiplexes.
+
+	Like `_wait_for_dom`, a timeout PROCEEDS and says so. A run against a page that never
+	rendered is a valid measurement of that condition — it is simply not a model failure, and
+	`browsin.diagnose` has to be able to tell those apart rather than charging it to the model,
+	which is exactly what happened on 2026-09-05 before this existed.
+	"""
+	require = CONTENT_GATE.get(host)
+	if not require:
+		return {'enabled': False}
+	try:
+		from browsin import pagestate as PS
+		r = await PS.wait_ready(cdp_url=chrome.cdp_url, host=host, require=require,
+		                        timeout_s=CONTENT_GATE_TIMEOUT_S)
+		out = r.as_dict()
+		out['enabled'] = True
+		return out
+	except Exception as exc:          # never BaseException: lease loss arrives as CancelledError
+		return {'enabled': True, 'ok': False, 'require': require,
+		        'reason': f'{type(exc).__name__}: {exc}'}
+
+
+async def _drive(task: G.Task, arm: Arm, *, proxy, chrome, scratch, run_dir, max_steps: int,
+                 nav_t0: float | None = None):
+	"""One agent run. Returns (history_dict, seconds, proxy_records_for_this_run, dom_ready)."""
 	from browser_use.browser.events import SwitchTabEvent
 	from browsin.agent import DEFAULT_EXCLUDED_ACTIONS, build_agent, build_llm, build_session, build_tools
 
@@ -347,6 +585,15 @@ async def _drive(task: G.Task, arm: Arm, *, proxy, chrome, scratch, run_dir, max
 		if chosen is None:
 			raise RuntimeError(f'SETUP_FAILED: no tab on {host}; tabs={[t.url[:60] for t in tabs]}')
 		await session.event_bus.dispatch(SwitchTabEvent(target_id=chosen.target_id))
+		# After the switch — its AgentFocusChangedEvent clears the state cache, so a build before
+		# it would be discarded — and before t0. row['seconds'] must keep meaning agent.run alone.
+		# It is NOT unchanged in content, though: the first DomService construction and CDP domain
+		# enablement now happen inside the probe rather than inside agent.run, while step 1's own
+		# build becomes the expensive full one (~0.8 s) instead of the cheap blank one (~0.3 s).
+		# On the fastest rows in the corpus (wiki-itn-lead at 6-10 s) that is a few percent, in
+		# both directions at once. Compare `seconds` across the boundary with that in mind.
+		dom_ready = await _wait_for_dom(session, enabled=arm.dom_ready, nav_t0=nav_t0)
+		dom_ready['content'] = await _wait_for_content(chrome, host)
 		# proxy.jsonl is written in COMPLETION order and a call abandoned by llm_timeout can land
 		# up to 1800 s late, so slice by seq, never by position.
 		seq0 = max((r.get('seq') or 0) for r in proxy.records()) if proxy.records() else 0
@@ -361,7 +608,7 @@ async def _drive(task: G.Task, arm: Arm, *, proxy, chrome, scratch, run_dir, max
 	history.save_to_file(run_dir / 'history.json')
 	hist = history.model_dump()
 	recs = sorted((r for r in proxy.records() if (r.get('seq') or 0) > seq0), key=lambda r: r.get('seq') or 0)
-	return hist, seconds, recs
+	return hist, seconds, recs, dom_ready
 
 
 def _refused(msg: str) -> int:
@@ -428,6 +675,12 @@ async def cmd_run(args, tasks: list[G.Task], arms: list[Arm], mode: str) -> int:
 		'tasks': [_task_spec(t) for t in tasks], 'max_steps_override': getattr(args, 'max_steps', None),
 		'ttl_s': args.ttl, 'may_evict': bool(args.evict), 'started': time.time(),
 		'resumed_from': getattr(args, 'resume', None),
+		# Provenance for the pre-run DOM-ready wait. Rows from before it and rows from after are
+		# otherwise distinguishable only by timestamp; `compare A B` across that boundary would
+		# silently mix eras. `compare` reads results.jsonl and not this file, so the rows carry
+		# `dom_ready` too — this is the human-readable copy of the settings they were taken under.
+		'dom_ready': {'min_elements': DOM_READY_MIN_ELEMENTS, 'timeout_s': DOM_READY_TIMEOUT_S,
+		              'poll_s': DOM_READY_POLL_S},
 	}, indent=1), encoding='utf-8')
 	print(f'run dir: {run_dir}   label: {args.label or "-"}   arms: {[a.name for a in arms]}', flush=True)
 
@@ -487,9 +740,16 @@ async def cmd_run(args, tasks: list[G.Task], arms: list[Arm], mode: str) -> int:
 							# fresh chrome + drive. ChromeError before RuntimeError: it IS a RuntimeError.
 							try:
 								chrome = await _fresh_chrome(B, task.url)
+								# The reference clock for dom_ready.nav_ms: B.start() returns 0-0.4 s
+								# after the CDP port answers (it polls at 0.4 s), and the tab was
+								# navigated by Chrome's own argv, so this is "page age" to within
+								# that jitter — the only way to tell a defective first build from a
+								# page that had simply not finished.
+								nav_t0 = time.monotonic()
 								print(f'{tag} chrome pid={chrome.pid} bind={chrome.bind}', flush=True)
-								hist, seconds, recs = await _drive(task, arm, proxy=proxy, chrome=chrome,
-								                                   scratch=scratch, run_dir=sub, max_steps=max_steps)
+								hist, seconds, recs, dom_ready = await _drive(task, arm, proxy=proxy, chrome=chrome,
+								                                              scratch=scratch, run_dir=sub,
+								                                              max_steps=max_steps, nav_t0=nav_t0)
 							except B.NotLoopback:
 								raise   # a security stop, never a setup failure
 							except (LeaseLost, asyncio.CancelledError, KeyboardInterrupt):
@@ -519,6 +779,10 @@ async def cmd_run(args, tasks: list[G.Task], arms: list[Arm], mode: str) -> int:
 							row = G.grade(task, expected, hist)
 							row.update(base)
 							row['seconds'] = seconds
+							# Top level, NEVER inside row['patterns']: diagnose counts every key of
+							# that dict as a fired detector, so a field present on every run would
+							# top the ROLLUP and hijack the NEXT footer.
+							row['dom_ready'] = dom_ready
 							seqs = [r.get('seq') for r in recs if r.get('seq') is not None]
 							row['proxy_seqs'] = seqs
 							row['proxy_seq'] = [min(seqs), max(seqs)] if seqs else None
@@ -554,8 +818,17 @@ async def cmd_run(args, tasks: list[G.Task], arms: list[Arm], mode: str) -> int:
 								flag = '  << HAD-THEN-LOST'
 							if row.get('substituted'):
 								flag += f"  << SUBSTITUTED {row['substituted']}"
+							# Two different faults, two different flags: a timeout means the DOM
+							# really never filled; an error means the probe broke while reading a
+							# DOM that may have been perfectly full, and the wait was a no-op.
+							if dom_ready.get('error'):
+								flag += f"  << dom-ready PROBE ERROR {dom_ready['error']}"
+							elif dom_ready.get('timed_out'):
+								flag += '  << dom-ready NEVER FILLED'
+							dom_txt = ('dom=off ' if not dom_ready.get('enabled') else
+							           f"dom={dom_ready['builds']}b/{dom_ready['ms']}ms/{dom_ready['elements']}el ")
 							print(f"{tag} {row['outcome']} {row['steps']}st {seconds}s waste={row['wasted_actions']} "
-							      f"-> {row['final'][:80]!r}{flag}", flush=True)
+							      f"{dom_txt}-> {row['final'][:80]!r}{flag}", flush=True)
 							block = D.render(task, rep, arm.name, row, found, hist, recs, str(sub), truth_note, max_steps)
 							(sub / 'DIAGNOSIS.txt').write_text(block + '\n', encoding='utf-8')
 							if row['outcome'] != 'CORRECT' or D.is_near_miss(row, D.median_correct_steps(rows, task.name)):
@@ -600,6 +873,43 @@ def _print_call_stats(recs: list[dict], num_ctx: int, run_dir: pathlib.Path) -> 
 	print(f'  proxy log:              {run_dir / "proxy.jsonl"}', flush=True)
 
 
+def _dom_ready_lines(rows: list[dict], arms) -> list[str]:
+	"""Harness provenance for the pre-run DOM-ready wait. Never enters the completion rate.
+
+	Per arm, because an A/B's claim that both arms met the same page has to be checked rather
+	than assumed — and because `--arms default,no-dom-ready` makes one arm's wait deliberately
+	absent. The last line is the only one that can falsify the fix: a run whose probe ended on a
+	full DOM and whose step 1 STILL carried a loading cue means the blank first state is not a
+	load race and the wait is not the mechanism. Without it a 0/8 proves only that something
+	changed.
+	"""
+	out: list[str] = []
+	for arm in arms:
+		dr = [r['dom_ready'] for r in rows
+		      if r.get('arm', 'default') == arm.name and isinstance(r.get('dom_ready'), dict)]
+		if not dr:
+			continue
+		on = [d for d in dr if d.get('enabled')]
+		if not on:
+			out.append(f'  dom-ready wait [{arm.name}]: DISABLED (control arm) over {len(dr)} run(s)')
+			continue
+		bad = sum(1 for d in on if d.get('timed_out'))
+		err = sum(1 for d in on if d.get('error'))
+		first_full = sum(1 for d in on if (d.get('builds') or 0) == 1 and not d.get('timed_out') and not d.get('error'))
+		out.append(f'  dom-ready wait [{arm.name}]: '
+		           f"{sum(d.get('builds') or 0 for d in on) / len(on):.1f} builds, "
+		           f"{sum(d.get('ms') or 0 for d in on) / len(on):.0f} ms mean over {len(on)} run(s); "
+		           f'{first_full} full on the first build; {bad} never filled; {err} probe error(s)')
+	full = [r for r in rows if isinstance(r.get('dom_ready'), dict) and r['dom_ready'].get('enabled')
+	        and not r['dom_ready'].get('timed_out') and not r['dom_ready'].get('error')
+	        and (r['dom_ready'].get('elements') or 0) >= DOM_READY_MIN_ELEMENTS]
+	if full:
+		still = sum(1 for r in full if 'blank_first_state' in (r.get('patterns') or {}))
+		out.append(f'  probe ended on a full DOM in {len(full)} run(s); blank_first_state still fired in {still}'
+		           + ('  << the wait is NOT the mechanism — read those step1 <page_stats> lines' if still else ''))
+	return out
+
+
 def _summarise(run_dir, rows, tasks, arms, args, aborted, mode) -> int:
 	from collections import Counter
 	lines = ['', '=' * 78,
@@ -625,6 +935,7 @@ def _summarise(run_dir, rows, tasks, arms, args, aborted, mode) -> int:
 	if excluded:
 		lines.append(f"  {len(excluded)} run(s) excluded from the rate: "
 		             + ', '.join(f'{o} {c}' for o, c in Counter(r['outcome'] for r in excluded).items()))
+	lines.extend(_dom_ready_lines(rows, arms))
 	lines.append('')
 	lines.append(D.rollup(rows))
 	lines.append('')
@@ -705,8 +1016,10 @@ def cmd_diagnose(args) -> int:
 		log_path = pathlib.Path(r['proxy_log']) if r.get('proxy_log') else sub.parent / 'proxy.jsonl'
 		recs = _proxy_slice(log_path, r.get('proxy_seqs') or r.get('proxy_seq'))
 		row = G.grade(task, r.get('expected'), hist)
-		# keep what only the live run could know: the post-run truth check and its timing
-		for k in ('outcome', 'correct', 'seconds', 'expected_after', 'truth_note', 'arm_effective'):
+		# keep what only the live run could know: the post-run truth check, its timing, and the
+		# pre-run DOM-ready wait (history.json cannot reconstruct any of them)
+		for k in ('outcome', 'correct', 'seconds', 'expected_after', 'truth_note', 'arm_effective',
+		          'dom_ready'):
 			if k in r:
 				row[k] = r[k]
 		found = D.detect(task, r.get('expected'), hist, row, recs, r.get('max_steps') or task.max_steps)
@@ -774,6 +1087,21 @@ MID_MSG = '<page_info>0.9 pages above, 2.4 pages below, 4.3 total pages</page_in
 MID2_MSG = '<page_info>2.4 pages above, 0.9 pages below, 4.3 total pages</page_info>\n[1]<a>x</a>'
 BOT_MSG = '<page_info>0.6 pages above, 0.0 pages below, 1.6 total pages</page_info>\n[1]<a>x</a>\n[End of page]'
 BLANK_MSG = '<page_info>0.0 pages above, 0.0 pages below, 1.0 total pages</page_info>\nInteractive elements:\nempty page'
+# The two <page_stats> lines browser-use actually emitted on Hacker News, copied verbatim from
+# runs/test-run-20260905-052408/hn-top-story-rep1/history.json steps 1 and 2. The blank one is the
+# 'Page appears empty' cue on its own — no 'empty page', no model wording — which is the shape all
+# ten HN runs of the 2026-09-05 corpus produced and the one the DOM-ready wait has to remove.
+HN_BLANK_STATS = ('<page_stats>Page appears empty - consider waiting - 0 links, 0 interactive, '
+                  '0 iframes, 2 total elements</page_stats>')
+HN_FULL_STATS = ('<page_stats>228 links, 543 interactive, 0 iframes, 1 shadow(open), '
+                 '0 shadow(closed), 2 images, 1094 total elements</page_stats>')
+# browser-use's SECOND loading cue (agent/prompts.py:236-243) — the elif that is structurally
+# unreachable while total_elements is 2 and becomes reachable exactly when a fix fills the DOM.
+# It appears ZERO times in the corpus, which is why a detector that grepped only the first
+# wording could have read a cue swap as a clean 0/8 pass.
+HN_LOADING_STATS = ('<page_stats>3 network request(s) in flight and little text rendered - page may '
+                    'still be loading, consider waiting - 228 links, 543 interactive, 0 iframes, '
+                    '1094 total elements</page_stats>')
 
 
 def cmd_self_check(_args) -> int:
@@ -970,6 +1298,28 @@ def cmd_self_check(_args) -> int:
 	ok('honest_miss fires on HONEST_MISS', 'honest_miss' in f and row['outcome'] == 'HONEST_MISS')
 	f, _ = det(RO, ['W'], _hist(_step(1, 'the page is empty', {'wait': {'seconds': 3}}, state_message=BLANK_MSG), _step(2, 'W', DONE('W'), state_message=TOP_MSG)))
 	ok('blank_first_state fires and reports the reaction', f.get('blank_first_state', {}).get('reaction') == ['wait'])
+	f, _ = det(RO, ['W'], _hist(_step(1, 'looking for the top story', {'scroll': {'down': True}},
+	                                  state_message=HN_BLANK_STATS + '\n' + TOP_MSG),
+	                            _step(2, 'W', DONE('W'), state_message=HN_FULL_STATS + '\n' + TOP_MSG)))
+	ok('… fires on the corpus wording alone — the cue all 10 HN runs produced, with no model wording',
+	   f.get('blank_first_state', {}).get('reaction') == ['scroll']
+	   and f['blank_first_state']['cue'] == 'Page appears empty'
+	   and '2 total elements' in f['blank_first_state']['stats'])
+	f, _ = det(RO, ['W'], _hist(_step(1, 'the stories are loading', {'scroll': {'down': True}},
+	                                  state_message=HN_LOADING_STATS + '\n' + TOP_MSG),
+	                            _step(2, 'W', DONE('W'), state_message=HN_FULL_STATS + '\n' + TOP_MSG)))
+	ok('… ALSO fires on the second cue, which only a filled DOM can reach — no cue-swap false pass',
+	   f.get('blank_first_state', {}).get('cue') == 'network request(s) in flight')
+	f, _ = det(RO, ['W'], _hist(_step(1, 'the top story is W', DONE('W'),
+	                                  state_message=HN_FULL_STATS + '\n' + TOP_MSG)))
+	ok('… and is SILENT on a full first state — the negative the DOM-ready wait is judged on',
+	   'blank_first_state' not in f)
+	pf = next((REPO / 'venv').glob('lib/python*/site-packages/browser_use/agent/prompts.py'), None)
+	src = pf.read_text(encoding='utf-8') if pf else ''
+	ok('both of browser-use\'s loading cues are still worded as the detector greps them',
+	   "page_stats['total_elements'] < 10" in src
+	   and 'Page appears empty - consider waiting - ' in src
+	   and 'network request(s) in flight and little text rendered - ' in src, str(pf))
 	f, _ = det(FREE, ['1815'], _hist(_step(1, 'm', {'input': {'index': 2, 'text': 'Ada Lovelace'}}),
 	                                _step(2, 'm', {'wait': {'seconds': 5}}), _step(3, 'm', {'wait': {'seconds': 5}}),
 	                                _step(4, 'm', DONE('not yet returned results', False))))
@@ -1052,6 +1402,95 @@ def cmd_self_check(_args) -> int:
 	ok('wilson(1,3) brackets 0.33 with a wide 80% interval', lo < 0.34 < hi and hi - lo > 0.4, f'{lo:.2f}–{hi:.2f}')
 	ok('fisher 2/8 vs 7/8 is significant (<0.1)', G.fisher_two_sided(2, 6, 7, 1) < 0.1, f'{G.fisher_two_sided(2, 6, 7, 1):.3f}')
 	ok('fisher 3/8 vs 6/8 is not (>0.1)', G.fisher_two_sided(3, 5, 6, 2) > 0.1, f'{G.fisher_two_sided(3, 5, 6, 2):.3f}')
+	print('== dom-ready wait: the mirror and the loop, against fakes (no card, no browser)')
+
+	class _Node:            # a SimplifiedNode stand-in — the mirror reads .original_node and .children
+		def __init__(self, *kids):
+			self.original_node, self.children = object(), list(kids)
+
+	class _DomState:        # a SerializedDOMState stand-in
+		def __init__(self, n, interactive=0):
+			self._root = _Node(*[_Node() for _ in range(n - 1)]) if n else None
+			self.selector_map = {i: object() for i in range(interactive)}
+
+	class _FakeSession:
+		"""Hands out canned states in order, then repeats the last, counting builds and resets."""
+
+		def __init__(self, *states):
+			self.states, self.calls = list(states), 0
+			self._cached_browser_state_summary = 'not cleared'
+			self._cached_selector_map = {1: object()}
+			self._dom_watchdog = self
+			self.watchdog_cleared = False
+
+		async def get_browser_state_summary(self, include_screenshot=True):
+			self.calls += 1
+			st = self.states[min(self.calls - 1, len(self.states) - 1)]
+			if isinstance(st, Exception):
+				raise st
+			return type('S', (), {'dom_state': st})()
+
+		def update_cached_selector_map(self, m):
+			self._cached_selector_map = m
+
+		def clear_cache(self):
+			self.watchdog_cleared = True
+
+	def _restored(s) -> bool:
+		"""Everything on_AgentFocusChangedEvent clears, cleared again — see _wait_for_dom."""
+		return (s._cached_browser_state_summary is None and s._cached_selector_map == {}
+		        and s.watchdog_cleared)
+
+	ok('_dom_elements mirrors total_elements (a root plus 11 children is 12)', _dom_elements(_DomState(12)) == 12)
+	ok("_dom_elements is 0 for a null tree, like prompts.py's _root guard", _dom_elements(_DomState(0)) == 0)
+	# The threshold is browser-use's, not ours: pin it to the installed library rather than to a
+	# number in this file. A predicate weaker than the cue would silence the detector while leaving
+	# the model just as blind — a no-op that reads as a fix.
+	ok("DOM_READY_MIN_ELEMENTS still equals the installed library's 'Page appears empty' threshold",
+	   DOM_READY_MIN_ELEMENTS == 10 and "page_stats['total_elements'] < 10" in src, str(pf))
+	s_ = _FakeSession(_DomState(2), _DomState(2), _DomState(1094, 543))   # the measured HN shape
+	r = asyncio.run(_wait_for_dom(s_, poll_s=0.0, nav_t0=None))
+	ok('the wait rebuilds until the DOM fills, counting every build (2, 2, 1094 -> 3)',
+	   r['builds'] == 3 and r['elements'] == 1094 and r['interactive'] == 543
+	   and not r['timed_out'] and not r['error'])
+	ok('… and records the per-build trajectory, which is what tells a bad build from a slow page',
+	   [t[1] for t in r['trace']] == [2, 2, 1094] and len(r['trace'][0]) == 3)
+	ok('… and restores every cache the tab switch had cleared (state, selector map, watchdog)',
+	   _restored(s_))
+	s_ = _FakeSession(_DomState(1094, 543))
+	r = asyncio.run(_wait_for_dom(s_, poll_s=0.0))
+	ok('a page already full costs exactly one build, never zero (builds==1 must stay meaningful)',
+	   r['builds'] == 1 and not r['timed_out'] and r['error'] is None and _restored(s_))
+	s_ = _FakeSession(_DomState(2))
+	r = asyncio.run(_wait_for_dom(s_, timeout_s=0.0, poll_s=0.0))
+	ok('on timeout the wait PROCEEDS and records it — never raises, never becomes SETUP_FAILED',
+	   r['timed_out'] and r['builds'] == 1 and r['elements'] == 2 and r['error'] is None and _restored(s_))
+	s_ = _FakeSession(RuntimeError('cdp gone'))
+	r = asyncio.run(_wait_for_dom(s_, poll_s=0.0))
+	ok('a probe that raises costs one recorded field, not the run',
+	   r['error'] == 'RuntimeError: cdp gone' and not r['timed_out'] and r['builds'] == 0)
+	ok('… and STILL restores the caches — the error path is the one that would leave them dirty',
+	   _restored(s_))
+	s_ = _FakeSession(_DomState(1094, 543))
+	r = asyncio.run(_wait_for_dom(s_, enabled=False))
+	ok('the no-dom-ready control issues no build at all — the wait is the only difference',
+	   r['enabled'] is False and r['builds'] == 0 and s_.calls == 0)
+	ok('nav_ms is recorded when the reference clock is passed, and None when it is not',
+	   asyncio.run(_wait_for_dom(_FakeSession(_DomState(20, 5)), nav_t0=time.monotonic()))['nav_ms'] is not None
+	   and asyncio.run(_wait_for_dom(_FakeSession(_DomState(20, 5))))['nav_ms'] is None)
+	ok('arms carry the dom_ready dimension and no-dom-ready is the only arm that drops it',
+	   Arm('default').dom_ready and Arm('enforce-read-only').dom_ready
+	   and not Arm('no-dom-ready').dom_ready and Arm('no-dom-ready').overrides == {}
+	   and Arm('no-dom-ready').extra_excluded == ())
+	rr = [{'task': 't', 'arm': 'default', 'outcome': 'CORRECT', 'patterns': {'blank_first_state': {}},
+	       'dom_ready': {'enabled': True, 'builds': 2, 'ms': 400, 'elements': 1094}},
+	      {'task': 't', 'arm': 'no-dom-ready', 'outcome': 'CORRECT', 'patterns': {},
+	       'dom_ready': {'enabled': False, 'builds': 0, 'ms': 0, 'elements': 0}}]
+	dl = _dom_ready_lines(rr, [Arm('default'), Arm('no-dom-ready')])
+	ok('the summary names the control arm and surfaces the falsifier (full DOM, cue still there)',
+	   any('DISABLED (control arm)' in l for l in dl)
+	   and any('still fired in 1' in l and 'NOT the mechanism' in l for l in dl))
+
 	print('== side effects')
 	runs_after = set(p.name for p in (REPO / 'runs').iterdir()) if (REPO / 'runs').exists() else set()
 	ok('self-check created no run directory', runs_after == runs_before)
@@ -1077,6 +1516,197 @@ def cmd_guide(_args) -> int:
 	return 0
 
 
+# ── xlike: the one flow whose truth is the page, not a fetch ────────────────────────────
+
+#: What the LIKE phase is told. No URL in it (directly_open_url is off, but a URL in the task is
+#: also what made Phase 4's G1 unfalsifiable), and it names the control by the word that is
+#: actually rendered next to it rather than by a data-testid the model cannot see.
+XLIKE_PROMPT = (
+	"This page is a list of posts. Find the {n} most recent posts that mention {topic}. "
+	"For each of those {n} posts, click its Like button — the heart icon in the row of icons "
+	"underneath that post's text. Click exactly {n} hearts, one per post, and do not click any "
+	"other icon or link. When you have clicked {n} hearts, call done."
+)
+
+#: What the UNLIKE phase is told. It leans on the one thing the model can see and the DOM cannot
+#: lie about: a liked heart is filled and coloured, an unliked one is an outline.
+XUNLIKE_PROMPT = (
+	"On this page, exactly {n} posts have already been liked: their heart icon is FILLED IN and "
+	"coloured, while every other heart is a hollow outline. Find those {n} filled hearts and "
+	"click each one to un-like that post. Clicking a filled heart turns it back into an outline. "
+	"Click exactly {n} filled hearts and do not click any hollow heart or any other icon. When "
+	"all the hearts are outlines again, call done."
+)
+
+
+def _xline(label: str, snap, want: str = '') -> str:
+	return (f'  {label:<22} liked={snap.liked:<3} tweets={snap.tweets:<3} '
+	        f'like_btns={snap.like:<3} testids={snap.total_testids:<4}' + (f'   {want}' if want else ''))
+
+
+async def cmd_xlike(args) -> int:
+	"""Like N posts, then un-like them, and grade BOTH on the page's own state.
+
+	This is the first task in the project whose truth cannot come from `browsin.grade`. Its three
+	fetchers (`wikipedia_itn_lead`, `hn_story`, `wikipedia_contains`) re-fetch the page over plain
+	anonymous HTTP, which is right for read-only tasks and structurally unable to answer "did the
+	Like land" — like state exists only inside a session-authenticated render. So the truth here is
+	`browsin.pagestate`, read over CDP from the very tab the model drove, before and after.
+
+	Ordering that matters, and why:
+
+	* **Chrome and the login check come BEFORE the lease.** A signed-out profile is a ~200 ms
+	  question; discovering it at step 1 costs a lease, a model load and ~15 minutes of the card.
+	* **The baseline is measured before anything is clicked.** Measured 2026-09-05, this account's
+	  liked count on x.com/OpenAI was 0, so leftovers are unambiguous — but the code never assumes
+	  that number. Everything below is stated as a DELTA from whatever the baseline turns out to
+	  be, so a page that already had likes on it is handled and the owner's own likes are never
+	  touched.
+	* **The safety net is in a `finally`.** The owner's stated worry is likes accumulating on a
+	  real account. If the model likes 2 and then fails to un-like them — or the run dies, or the
+	  lease is lost — the harness removes the excess itself and says so loudly. It clicks only
+	  `[data-testid="unlike"]`, so a stale selector clicks nothing rather than liking something.
+	* **A leftover from a PREVIOUS crashed run is cleaned at the start too**, since a `finally`
+	  cannot cover SIGKILL. Together those two cover every path except the card being pulled out
+	  of the wall mid-click.
+
+	Two agent runs, not one. A single run would have to hold "which two did I like" across a
+	dozen steps of a virtualised timeline, and `had_then_lost` is the most common failure in this
+	project's census. Two runs let the harness carry that state instead of the model, and it makes
+	each phase separately gradeable — which is the difference between "it failed" and "it liked
+	fine and could not un-like".
+	"""
+	from browsin import browser as B
+	from browsin import diagnose as D
+	from browsin import pagestate as PS
+	from browsin.interlock import Interlock, card_preflight
+	from browsin.lease import LeaseAssertionError, hold, normalise_tag
+	from browsin.proxy import Proxy
+	from warden.client import LeaseLost, WardenError
+
+	n = int(args.n)
+	host = args.url.split('/')[2]
+	if normalise_tag(WORKLOAD) != MODEL_TAG:
+		return _refused(f'MODEL_TAG {MODEL_TAG!r} != normalise_tag({WORKLOAD!r})')
+	if not B._have_systemd_run():
+		return _refused('systemd-run is unavailable, so a fresh Chrome per run cannot be guaranteed')
+	take_lock()
+	try:
+		await card_preflight(evict=args.evict)
+	except Interlock as exc:
+		release_lock(); return _refused(str(exc))
+	except WardenError as exc:
+		release_lock(); return _refused(f'warden: {exc}')
+
+	run_dir, scratch = _enter_run_dir('xlike')
+	print(f'run dir: {run_dir}   topic={args.topic!r}  n={n}  url={args.url}', flush=True)
+
+	chrome = None
+	baseline = None
+	cleanup: dict = {}
+	rc = 1
+	try:
+		# ── Chrome, readiness and the login check: all BEFORE the card is touched ──────
+		chrome = await _fresh_chrome(B, args.url)
+		print(f'chrome pid={chrome.pid} bind={chrome.bind}', flush=True)
+		ready = await PS.wait_ready(cdp_url=chrome.cdp_url, host=host, require='x-timeline',
+		                            timeout_s=CONTENT_GATE_TIMEOUT_S)
+		print(f'page ready: {ready.ok}  {ready.reason}  ({ready.waited_s:.1f}s, {ready.polls} poll(s))',
+		      flush=True)
+		if not ready.ok:
+			return _refused(f'{args.url} never rendered a timeline within '
+			                f'{CONTENT_GATE_TIMEOUT_S:.0f}s. {ready.reason}')
+		try:
+			baseline = await PS.assert_logged_in(cdp_url=chrome.cdp_url, host=host)
+		except PS.PageStateError as exc:
+			return _refused(str(exc))
+
+		census = await PS.probe_testids(cdp_url=chrome.cdp_url, host=host)
+		print('selector census (top 8, so a renamed data-testid announces itself rather than '
+		      'grading as zero):', flush=True)
+		print(f'  {census[:8]}', flush=True)
+		print(_xline('BASELINE', baseline), flush=True)
+
+		# A leftover from a previous run that died past its own finally (SIGKILL, power).
+		if baseline.liked > 0:
+			print(f'\n  !! {baseline.liked} post(s) were ALREADY liked before this run started.\n'
+			      f'     Treating that as the baseline and never touching them: every number below '
+			      f'is a delta.\n', flush=True)
+
+		# ── now the card ───────────────────────────────────────────────────────────────
+		arm = Arm('default')
+		t0 = time.monotonic()
+		phases: list[dict] = []
+		async with hold(WORKLOAD, reason=f'test.py xlike {args.topic}'[:120],
+		                num_ctx=NUM_CTX, ttl_s=args.ttl, may_evict=bool(args.evict)) as card:
+			print(f'lease granted in {time.monotonic() - t0:.1f}s  served num_ctx={card.num_ctx}\n',
+			      flush=True)
+			with Proxy(card.endpoint, run_dir / 'proxy.jsonl') as proxy:
+				for phase, prompt_t, want in (('like', XLIKE_PROMPT, baseline.liked + n),
+				                              ('unlike', XUNLIKE_PROMPT, baseline.liked)):
+					sub = run_dir / phase
+					sub.mkdir(parents=True, exist_ok=True)
+					task = G.Task(name=f'xlike-{phase}', url=args.url,
+					              prompt=prompt_t.format(n=n, topic=args.topic),
+					              expect=G.nothing_to_find, max_steps=args.max_steps,
+					              read_only=False)
+					print(f'── {phase.upper()} phase ' + '─' * 50, flush=True)
+					hist, seconds, recs, dom_ready = await _drive(
+						task, arm, proxy=proxy, chrome=chrome, scratch=scratch, run_dir=sub,
+						max_steps=args.max_steps, nav_t0=None)
+					snap = await PS.snapshot(cdp_url=chrome.cdp_url, host=host)
+					row = G.grade(task, None, hist)
+					row.update({'task': task.name, 'rep': 1, 'arm': 'default', 'seconds': seconds,
+					            'run_dir': str(sub), 'max_steps': args.max_steps,
+					            'dom_ready': dom_ready, 'liked_after': snap.liked,
+					            'liked_wanted': want, 'phase': phase})
+					_append(run_dir / 'results.jsonl', row)
+					found = D.detect(task, None, hist, row, recs, args.max_steps)
+					print(D.render(task, 1, 'default', row, found, hist, recs, str(sub), '',
+					               args.max_steps), flush=True)
+					print(_xline(f'AFTER {phase.upper()}', snap,
+					             f'wanted liked={want}  ->  '
+					             + ('OK' if snap.liked == want else 'MISS')), flush=True)
+					phases.append({'phase': phase, 'liked': snap.liked, 'want': want,
+					               'ok': snap.liked == want, 'steps': row.get('steps'),
+					               'seconds': seconds})
+					print('', flush=True)
+
+		liked_ok = phases[0]['ok'] if phases else False
+		unliked_ok = phases[1]['ok'] if len(phases) > 1 else False
+		rc = 0 if (liked_ok and unliked_ok) else 1
+		return rc
+	except (LeaseLost, LeaseAssertionError) as exc:
+		print(f'\nLEASE: {type(exc).__name__}: {exc}', flush=True)
+		return 1
+	finally:
+		# ── the safety net. Runs on every path out, including an exception or Ctrl-C. ──
+		if chrome is not None and baseline is not None:
+			try:
+				final = await PS.snapshot(cdp_url=chrome.cdp_url, host=host)
+				excess = final.liked - baseline.liked
+				if excess > 0:
+					print(f'\n  !! SAFETY NET: {excess} like(s) left over after the run. '
+					      f'Removing them now so nothing accumulates on the account.', flush=True)
+					cleanup = await PS.unlike_up_to(excess, cdp_url=chrome.cdp_url, host=host)
+					await asyncio.sleep(1.5)          # let x.com's optimistic UI settle
+					after = await PS.snapshot(cdp_url=chrome.cdp_url, host=host)
+					still = after.liked - baseline.liked
+					print(f'     clicked {cleanup.get("clicked")} of {cleanup.get("found")} '
+					      f'-> liked is now {after.liked} (baseline {baseline.liked})', flush=True)
+					if still > 0:
+						print(f'     *** {still} STILL LIKED. Un-like them by hand: {args.url}',
+						      flush=True)
+				else:
+					print(f'\n  safety net: nothing to clean (liked={final.liked}, '
+					      f'baseline={baseline.liked}).', flush=True)
+			except Exception as exc:
+				print(f'\n  *** SAFETY NET FAILED: {type(exc).__name__}: {exc}\n'
+				      f'      CHECK {args.url} BY HAND for leftover likes.', flush=True)
+		release_lock()
+		print(f'\n  run dir: {run_dir}', flush=True)
+
+
 # ── argv ────────────────────────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1087,7 +1717,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 	def leasing(p):
 		p.add_argument('--arms', default='default',
-		               help='comma list: default | enforce-read-only | sysmsg:PATH | set:KEY=JSON (default: %(default)s)')
+		               help='comma list: default | no-dom-ready | enforce-read-only | sysmsg:PATH | set:KEY=JSON '
+		                    '(default: %(default)s)')
 		p.add_argument('--label', default='', help='free text recorded in run.json and the lease reason')
 		p.add_argument('--evict', action='store_true',
 		               help='authorise displacing the public voice service (clonin) — at preflight AND at the acquire. Never in a loop.')
@@ -1112,6 +1743,20 @@ def build_parser() -> argparse.ArgumentParser:
 	               help='the task forbids interaction: count input/click/... as wasted and make the task eligible '
 	                    'for the enforce-read-only arm (pass --arms default,enforce-read-only to actually enforce)')
 	leasing(o)
+
+	x = sub.add_parser('xlike', help='like N posts about a topic then un-like them; graded on the '
+	                                  'page\'s own state, never on the agent\'s done flag')
+	x.add_argument('--url', default='https://x.com/OpenAI', help='(default: %(default)s)')
+	x.add_argument('--topic', default='Astra', help='what the posts should be about (default: %(default)s)')
+	x.add_argument('--n', type=int, default=2, help='how many to like, then un-like (default: %(default)s)')
+	x.add_argument('--max-steps', type=int, default=30,
+	               help='per PHASE, not per run; this task is far longer than the table (default: %(default)s)')
+	# Deliberately NOT leasing(): --arms would be a silent no-op here (one arm, two fixed phases),
+	# and this project treats an accepted-but-ignored flag as a bug, not a convenience.
+	x.add_argument('--label', default='', help='free text recorded in the lease reason')
+	x.add_argument('--evict', action='store_true',
+	               help='authorise displacing the public voice service (clonin). Never in a loop.')
+	x.add_argument('--ttl', type=int, default=DEFAULT_TTL_S, help='lease ttl_s (default: %(default)s)')
 
 	d = sub.add_parser('diagnose', help='offline: re-render DIAGNOSIS blocks from a run dir')
 	d.add_argument('rundir')
@@ -1140,6 +1785,9 @@ def main(argv: list[str]) -> int:
 		return cmd_diagnose(args)
 	if args.cmd == 'compare':
 		return cmd_compare(args)
+
+	if args.cmd == 'xlike':
+		return asyncio.run(cmd_xlike(args))
 
 	if args.cmd in ('run', 'one'):
 		arms = parse_arms(args.arms)   # SystemExit with REFUSED TO START on a bad spec, before any card time
