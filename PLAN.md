@@ -2326,3 +2326,68 @@ arm as the default for `read_only` tasks, flip `wiki-scroll-deep`'s mis-set `rea
 `stuck_narrative` into `NOT_A_TARGET`; (3) re-run the no-arm table against landed code and paste
 it here. The `blank_first_state` question needs a batch taken when the race actually reproduces —
 `--arms default,no-dom-ready` is the instrument, and `nav_ms` now says what to look for.
+
+### x.com: the first task graded on the driven page, and two defects it found in the grader
+
+**2026-09-05, later — `tools/test.py xlike` and `browsin/pagestate.py`. The like phase PASSES;
+the un-like phase does not yet. Both defects found were in the harness, and the second was in
+the safety net itself.** Ground truth here cannot come from `browsin.grade` — its three fetchers
+re-fetch anonymously over HTTP and like-state exists only inside a session-authenticated render
+— so `pagestate.py` reads the driven tab over raw CDP, importing no `browser_use` so the login
+precheck runs before the lease.
+
+**The content gate works, and it is not the DOM-element wait.** `x-timeline` (at least one
+`article[data-testid="tweet"]`) was satisfied in **2.7–3.3 s over 5–6 polls**. `_wait_for_dom`
+alone could not have covered it: it clears at 10 DOM nodes and a boot splash is a real DOM of
+about that size. The run that provoked all of this died at step 1 in 8.3 s having been shown
+the splash; a second, independent run reproduced the race exactly — step 1 served 1,071 chars,
+step 2 served 18,407, with "Astra" mentions in the served state climbing 7 → 36 from step 2.
+
+**Run 1 — the model missed by three indices and never noticed.** 29 identical
+`click[1063] → <div>`, then a forced `done` at 30/30. The state message shows why:
+
+```
+[1060]<button aria-label=2845 Likes. Like />     <- the target
+[1063]<div />                                    <- what it clicked, 29 times
+```
+
+Not blindness and not confusion about the task — its own memory correctly read *"the post is
+from 19 hours ago and mentions GPT-6 Astra"*. It picked a bare unlabelled wrapper three indices
+away, out of **698 interactive elements**, and `stuck_narrative` then froze it there. This is
+the `clicked_unlabelled_element` pattern the previous entry predicted and had no counter for.
+
+**Run 2 — naming the target string fixed the like phase outright: 2 of 2.** The prompt now
+names the aria-label literally and forbids clicking anything unlabelled. Note what kind of
+instruction that is: the persuasion layer is measured inert three ways, but that finding is
+about *behavioural* instructions ("finish promptly", "scroll further"). A *targeting* string
+converts a spatial hunt into string matching, and this 7B obeys it.
+
+**The un-like phase failed for a reason that was a guess, and the probe caught it in one run.**
+Measured: once liked, the button's aria-label becomes `"2872 Likes. Liked"` — **not
+"Unlike"**. Only the `data-testid` flips to `unlike`, and the model never sees data-testid. The
+first draft told it to find a string that does not occur on the page, and it un-liked 1 of 2.
+`pagestate.aria_labels()` now prints both states every run, so this is never guessed again.
+
+**The defect that mattered most was in the safety net, and it was the "I could not check, so I
+passed" shape this file keeps re-finding.** It counted `[data-testid="unlike"]` among the posts
+rendered in the tab — a viewport of one timeline. It reported **"liked is now 0 (baseline 0)"**
+while the account's own Likes page held **5**: the model had wandered into the reply thread and
+liked four replies that were never rendered where the check was looking. All five were verified
+ours (each reply author appears 20–23× in the run's history) and removed. So:
+
+* the baseline, every per-phase count and the cleanup now read the account's own
+  `x.com/<handle>/likes`, located from the signed-in handle rather than hardcoded;
+* `liked_count` **raises** rather than returning 0 when it cannot look, because a zero meaning
+  "could not check" is the exact failure it replaced;
+* the run refuses to start at all if that list is unreadable — it will not create likes it
+  cannot prove it can remove;
+* both prompts now forbid leaving the page, since wandering is what produced the extra three.
+
+A second grader defect, same family: the un-like phase could **pass by doing nothing**. If the
+like phase never raised the count, the un-like target (baseline) was already satisfied before it
+began. It now reports `NOT TESTED` and cannot make the overall result green.
+
+Open: re-run and confirm un-like now clears with the corrected `'Liked'` string. If the model
+still cannot hit the control on a 698-element page, the next lever is to shrink the page — open
+each post on its own URL — rather than to reword again, and that should be settled by
+measurement, not by another prompt draft.

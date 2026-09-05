@@ -138,6 +138,21 @@ _UNLIKE_JS = r"""
 """
 
 
+#: The aria-label is what browser-use actually shows the model — its serialised element line is
+#: `[1060]<button aria-label=2845 Likes. Like />`. The data-testid is invisible to the model. So
+#: when a task has to NAME its target for a 7B that measurably obeys concrete strings better than
+#: behavioural prose, this is the string that matters, and guessing it is how a run gets graded
+#: against a selector nobody checked. Reported every run for that reason.
+_ARIA_JS = r"""
+(() => {
+  const pick = sel => Array.from(document.querySelectorAll(sel))
+    .slice(0, 4)
+    .map(e => (e.getAttribute('aria-label') || '(none)'));
+  return JSON.stringify({like: pick('[data-testid="like"]'), unlike: pick('[data-testid="unlike"]')});
+})()
+"""
+
+
 class PageStateError(RuntimeError):
 	"""The tab could not be read. Never silently a zero count."""
 
@@ -376,6 +391,15 @@ async def wait_ready(*, cdp_url: str = DEFAULT_CDP, host: str = '', require: str
 	return out
 
 
+async def aria_labels(*, cdp_url: str = DEFAULT_CDP, host: str = '') -> dict:
+	"""What the like/unlike buttons are actually called, as the model sees them."""
+	raw = await evaluate(_ARIA_JS, cdp_url=cdp_url, host=host)
+	try:
+		return json.loads(raw)
+	except json.JSONDecodeError:
+		return {'like': [], 'unlike': []}
+
+
 async def unlike_up_to(limit: int, *, cdp_url: str = DEFAULT_CDP, host: str = '') -> dict:
 	"""The safety net: click at most `limit` liked posts back to unliked. Returns evidence.
 
@@ -390,6 +414,85 @@ async def unlike_up_to(limit: int, *, cdp_url: str = DEFAULT_CDP, host: str = ''
 		return json.loads(raw)
 	except json.JSONDecodeError as exc:
 		raise PageStateError(f'unlike did not return JSON: {raw[:200]!r}') from exc
+
+
+#: Who is signed in, read from the avatar container's own data-testid
+#: (`UserAvatar-Container-<handle>`). Needed because the authoritative like list lives at a
+#: per-account URL and hardcoding a handle would silently verify the wrong account.
+_HANDLE_JS = r"""
+(() => {
+  const e = document.querySelector('[data-testid^="UserAvatar-Container-"]');
+  return e ? e.getAttribute('data-testid').replace('UserAvatar-Container-', '') : '';
+})()
+"""
+
+
+async def account_handle(*, cdp_url: str = DEFAULT_CDP, host: str = '') -> str:
+	"""The signed-in account's handle, or '' if it cannot be read."""
+	try:
+		return (await evaluate(_HANDLE_JS, cdp_url=cdp_url, host=host)) or ''
+	except PageStateError:
+		return ''
+
+
+async def goto(url: str, *, cdp_url: str = DEFAULT_CDP, host: str = '',
+               require: str = 'content', timeout_s: float = 30.0) -> Readiness:
+	"""Navigate the driven tab and wait for it to be worth reading. Harness-only."""
+	await evaluate(f'(()=>{{location.href={url!r}; return "nav"}})()',
+	               cdp_url=cdp_url, host=host)
+	await asyncio.sleep(2.0)          # let the SPA begin its route change before polling
+	return await wait_ready(cdp_url=cdp_url, host=host, require=require, timeout_s=timeout_s)
+
+
+async def liked_count(*, cdp_url: str = DEFAULT_CDP, host: str = '', handle: str = '') -> tuple:
+	"""The AUTHORITATIVE number of posts this account has liked, from its own Likes page.
+
+	Why this is not `snapshot().liked`. That counts `[data-testid="unlike"]` among the posts
+	*currently rendered in the tab*, which is only ever a viewport of one timeline. Measured
+	2026-09-05, and it is the reason this function exists: a run liked 2 posts on x.com/OpenAI,
+	the model then navigated into the reply thread and liked more, and the profile-page count
+	afterwards read 1 — while the account's Likes page held **5**. The harness reported
+	"liked is now 0 (baseline 0)" and the account was not clean. A count that can silently miss
+	what it is supposed to guard is worse than no count, because it is trusted.
+
+	Returns (count, url_checked). Raises rather than returning 0 on failure: a zero that means
+	"could not look" is exactly the failure this replaced.
+	"""
+	handle = handle or await account_handle(cdp_url=cdp_url, host=host)
+	if not handle:
+		raise PageStateError('cannot determine the signed-in handle, so the authoritative '
+		                     'Likes page cannot be located; refusing to report a like count')
+	url = f'https://x.com/{handle}/likes'
+	r = await goto(url, cdp_url=cdp_url, host=host)
+	snap = await snapshot(cdp_url=cdp_url, host=host)
+	if not r.ok and snap.tweets == 0 and snap.total_testids == 0:
+		raise PageStateError(f'{url} never rendered; {r.reason}')
+	return snap.tweets, snap.url
+
+
+async def unlike_everything(*, cdp_url: str = DEFAULT_CDP, host: str = '', handle: str = '',
+                            keep: int = 0, max_rounds: int = 25) -> dict:
+	"""Un-like from the account's Likes page until `keep` remain. One at a time, verified.
+
+	One per round rather than a batch: un-liking removes the post from this list, so the page
+	re-renders under the click and a batch would be clicking stale nodes. Slower and correct.
+	"""
+	handle = handle or await account_handle(cdp_url=cdp_url, host=host)
+	if not handle:
+		raise PageStateError('cannot determine the signed-in handle; refusing to click blind')
+	await goto(f'https://x.com/{handle}/likes', cdp_url=cdp_url, host=host)
+	removed = 0
+	for _ in range(max_rounds):
+		snap = await snapshot(cdp_url=cdp_url, host=host)
+		if snap.unlike <= keep:
+			break
+		r = await unlike_up_to(1, cdp_url=cdp_url, host=host)
+		removed += int(r.get('clicked') or 0)
+		await asyncio.sleep(2.5)
+	await goto(f'https://x.com/{handle}/likes', cdp_url=cdp_url, host=host)
+	final = await snapshot(cdp_url=cdp_url, host=host)
+	return {'removed': removed, 'remaining': final.tweets, 'handle': handle,
+	        'url': f'https://x.com/{handle}/likes'}
 
 
 async def assert_logged_in(*, cdp_url: str = DEFAULT_CDP, host: str = '',

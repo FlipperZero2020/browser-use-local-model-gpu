@@ -1522,20 +1522,43 @@ def cmd_guide(_args) -> int:
 #: also what made Phase 4's G1 unfalsifiable), and it names the control by the word that is
 #: actually rendered next to it rather than by a data-testid the model cannot see.
 XLIKE_PROMPT = (
-	"This page is a list of posts. Find the {n} most recent posts that mention {topic}. "
-	"For each of those {n} posts, click its Like button — the heart icon in the row of icons "
-	"underneath that post's text. Click exactly {n} hearts, one per post, and do not click any "
-	"other icon or link. When you have clicked {n} hearts, call done."
+	"This page lists posts. Under each post is a row of buttons. The Like button is the one "
+	"whose aria-label ENDS WITH the words 'Likes. Like' — for example "
+	"[1060]<button aria-label=2845 Likes. Like />.\n\n"
+	"Find the {n} most recent posts that mention {topic}. For each one, click that post's Like "
+	"button.\n\n"
+	"Rules, which matter more than anything else in this task:\n"
+	"- ONLY click an element whose aria-label ends with 'Likes. Like'.\n"
+	"- NEVER click an element with no aria-label, such as [1063]<div />. Those are empty "
+	"wrappers and clicking one does nothing at all.\n"
+	"- Stay on this page. Do NOT open a post, a profile, a reply or any link: measured "
+	"2026-09-05, wandering into a reply thread is how a run liked 5 posts when asked for 2.\n"
+	"- After each click, look at the new screenshot. If the heart did not change, you clicked "
+	"the wrong index — pick a DIFFERENT index that ends with 'Likes. Like'. Never send the same "
+	"index twice.\n"
+	"When you have liked {n} posts, call done."
 )
 
-#: What the UNLIKE phase is told. It leans on the one thing the model can see and the DOM cannot
-#: lie about: a liked heart is filled and coloured, an unliked one is an outline.
+#: MEASURED 2026-09-05, and the first draft of this prompt was wrong because it was guessed:
+#: once a post is liked its button's aria-label becomes "<n> Likes. Liked" — NOT "Unlike". The
+#: draft told the model to hunt for a string that does not occur on the page, and it un-liked 1
+#: of 2. Only the data-testid flips to `unlike`, and the model never sees data-testid. The
+#: aria-label probe printed on every run exists so this is never guessed again.
 XUNLIKE_PROMPT = (
-	"On this page, exactly {n} posts have already been liked: their heart icon is FILLED IN and "
-	"coloured, while every other heart is a hollow outline. Find those {n} filled hearts and "
-	"click each one to un-like that post. Clicking a filled heart turns it back into an outline. "
-	"Click exactly {n} filled hearts and do not click any hollow heart or any other icon. When "
-	"all the hearts are outlines again, call done."
+	"On this page, {n} posts have already been liked. A post that IS liked has a button whose "
+	"aria-label ends with the word 'Liked' — for example "
+	"[1060]<button aria-label=2872 Likes. Liked />. A post that is NOT liked ends with 'Like' "
+	"instead.\n\n"
+	"Find every button whose aria-label ends with 'Liked' and click it. Clicking it turns that "
+	"post back to unliked.\n\n"
+	"Rules, which matter more than anything else in this task:\n"
+	"- ONLY click an element whose aria-label ends with the word 'Liked'.\n"
+	"- Do NOT click one ending in 'Like' — that would like a post instead of un-liking it.\n"
+	"- NEVER click an element with no aria-label, such as [1063]<div />.\n"
+	"- Stay on this page. Do not open a post, a profile or a reply.\n"
+	"- After each click, look at the new screenshot. If nothing changed, pick a DIFFERENT "
+	"index. Never send the same index twice.\n"
+	"When no button ends with 'Liked' any more, call done."
 )
 
 
@@ -1603,6 +1626,8 @@ async def cmd_xlike(args) -> int:
 
 	chrome = None
 	baseline = None
+	base_liked = None
+	handle = ''
 	cleanup: dict = {}
 	rc = 1
 	try:
@@ -1621,11 +1646,31 @@ async def cmd_xlike(args) -> int:
 		except PS.PageStateError as exc:
 			return _refused(str(exc))
 
+		# The AUTHORITATIVE baseline: the account's own Likes page, not this timeline's viewport.
+		# Measured 2026-09-05: the viewport count said 0 while the Likes page held 5.
+		handle = await PS.account_handle(cdp_url=chrome.cdp_url, host=host)
+		try:
+			base_liked, likes_url = await PS.liked_count(cdp_url=chrome.cdp_url, host=host,
+			                                             handle=handle)
+		except PS.PageStateError as exc:
+			return _refused(f'cannot read the authoritative like list, so this run could not be '
+			                f'cleaned up afterwards; refusing to create likes it cannot remove: {exc}')
+		print(f'signed in as @{handle}; authoritative Likes page {likes_url} holds {base_liked} '
+		      f'liked post(s) — that is the baseline, and none of them will be touched', flush=True)
+		await PS.goto(args.url, cdp_url=chrome.cdp_url, host=host, require='x-timeline')
+
 		census = await PS.probe_testids(cdp_url=chrome.cdp_url, host=host)
 		print('selector census (top 8, so a renamed data-testid announces itself rather than '
 		      'grading as zero):', flush=True)
 		print(f'  {census[:8]}', flush=True)
 		print(_xline('BASELINE', baseline), flush=True)
+		try:
+			aria = await PS.aria_labels(cdp_url=chrome.cdp_url, host=host)
+			print(f'  aria-labels the model will see: like={aria.get("like")[:2]} '
+			      f'unlike={aria.get("unlike")[:2]}', flush=True)
+		except Exception as exc:
+			print(f'  aria-label probe failed ({type(exc).__name__}); prompts name these strings, '
+			      f'so check them by hand if this run misses', flush=True)
 
 		# A leftover from a previous run that died past its own finally (SIGKILL, power).
 		if baseline.liked > 0:
@@ -1642,8 +1687,8 @@ async def cmd_xlike(args) -> int:
 			print(f'lease granted in {time.monotonic() - t0:.1f}s  served num_ctx={card.num_ctx}\n',
 			      flush=True)
 			with Proxy(card.endpoint, run_dir / 'proxy.jsonl') as proxy:
-				for phase, prompt_t, want in (('like', XLIKE_PROMPT, baseline.liked + n),
-				                              ('unlike', XUNLIKE_PROMPT, baseline.liked)):
+				for phase, prompt_t, want in (('like', XLIKE_PROMPT, base_liked + n),
+				                              ('unlike', XUNLIKE_PROMPT, base_liked)):
 					sub = run_dir / phase
 					sub.mkdir(parents=True, exist_ok=True)
 					task = G.Task(name=f'xlike-{phase}', url=args.url,
@@ -1654,26 +1699,52 @@ async def cmd_xlike(args) -> int:
 					hist, seconds, recs, dom_ready = await _drive(
 						task, arm, proxy=proxy, chrome=chrome, scratch=scratch, run_dir=sub,
 						max_steps=args.max_steps, nav_t0=None)
+					try:
+						a2 = await PS.aria_labels(cdp_url=chrome.cdp_url, host=host)
+						print(f'  aria after {phase}: like={a2.get("like")[:2]} '
+						      f'liked={a2.get("unlike")[:2]}', flush=True)
+					except Exception:
+						pass
+					# Count on the Likes page, which sees every like wherever it was made, then come
+					# back so the next phase starts where the task says it should.
+					now_liked, _ = await PS.liked_count(cdp_url=chrome.cdp_url, host=host, handle=handle)
+					await PS.goto(args.url, cdp_url=chrome.cdp_url, host=host, require='x-timeline')
 					snap = await PS.snapshot(cdp_url=chrome.cdp_url, host=host)
 					row = G.grade(task, None, hist)
 					row.update({'task': task.name, 'rep': 1, 'arm': 'default', 'seconds': seconds,
 					            'run_dir': str(sub), 'max_steps': args.max_steps,
-					            'dom_ready': dom_ready, 'liked_after': snap.liked,
+					            'dom_ready': dom_ready, 'liked_after': now_liked,
 					            'liked_wanted': want, 'phase': phase})
 					_append(run_dir / 'results.jsonl', row)
 					found = D.detect(task, None, hist, row, recs, args.max_steps)
 					print(D.render(task, 1, 'default', row, found, hist, recs, str(sub), '',
 					               args.max_steps), flush=True)
-					print(_xline(f'AFTER {phase.upper()}', snap,
-					             f'wanted liked={want}  ->  '
-					             + ('OK' if snap.liked == want else 'MISS')), flush=True)
-					phases.append({'phase': phase, 'liked': snap.liked, 'want': want,
-					               'ok': snap.liked == want, 'steps': row.get('steps'),
+					print(f'  AFTER {phase.upper():<7} account-wide liked={now_liked}  '
+					      f'wanted={want}  ->  ' + ('OK' if now_liked == want else 'MISS')
+					      + f'   (this page: tweets={snap.tweets} like_btns={snap.like})', flush=True)
+					phases.append({'phase': phase, 'liked': now_liked, 'want': want,
+					               'ok': now_liked == want, 'steps': row.get('steps'),
 					               'seconds': seconds})
 					print('', flush=True)
 
+		# The unlike phase must not be able to pass by doing nothing. If the like phase never
+		# raised the count, the unlike phase's target (baseline) is ALREADY satisfied before it
+		# starts, and reporting that as OK would be the "I could not check, so I passed" shape
+		# this project forbids (browsin/lease.py:297, tools/phase2_gate.py:234, Phase 4's G5).
 		liked_ok = phases[0]['ok'] if phases else False
-		unliked_ok = phases[1]['ok'] if len(phases) > 1 else False
+		unliked_ok = (len(phases) > 1 and phases[1]['ok'] and liked_ok)
+		print('=' * 78, flush=True)
+		print(f'  VERDICT   like phase   : {"PASS" if liked_ok else "FAIL"}'
+		      f'   (liked {phases[0]["liked"] if phases else "?"} of a wanted '
+		      f'{phases[0]["want"] if phases else "?"})', flush=True)
+		if not liked_ok:
+			print('            unlike phase : NOT TESTED — the like phase never created a like, '
+			      'so there was nothing to remove and its result is meaningless', flush=True)
+		else:
+			print(f'            unlike phase : {"PASS" if phases[1]["ok"] else "FAIL"}'
+			      f'   (liked {phases[1]["liked"]} of a wanted {phases[1]["want"]})', flush=True)
+		print(f'  RESULT    {"PASS" if (liked_ok and unliked_ok) else "FAIL"}', flush=True)
+		print('=' * 78, flush=True)
 		rc = 0 if (liked_ok and unliked_ok) else 1
 		return rc
 	except (LeaseLost, LeaseAssertionError) as exc:
@@ -1681,28 +1752,29 @@ async def cmd_xlike(args) -> int:
 		return 1
 	finally:
 		# ── the safety net. Runs on every path out, including an exception or Ctrl-C. ──
-		if chrome is not None and baseline is not None:
+		if chrome is not None and base_liked is not None:
 			try:
-				final = await PS.snapshot(cdp_url=chrome.cdp_url, host=host)
-				excess = final.liked - baseline.liked
-				if excess > 0:
-					print(f'\n  !! SAFETY NET: {excess} like(s) left over after the run. '
-					      f'Removing them now so nothing accumulates on the account.', flush=True)
-					cleanup = await PS.unlike_up_to(excess, cdp_url=chrome.cdp_url, host=host)
-					await asyncio.sleep(1.5)          # let x.com's optimistic UI settle
-					after = await PS.snapshot(cdp_url=chrome.cdp_url, host=host)
-					still = after.liked - baseline.liked
-					print(f'     clicked {cleanup.get("clicked")} of {cleanup.get("found")} '
-					      f'-> liked is now {after.liked} (baseline {baseline.liked})', flush=True)
-					if still > 0:
-						print(f'     *** {still} STILL LIKED. Un-like them by hand: {args.url}',
-						      flush=True)
-				else:
-					print(f'\n  safety net: nothing to clean (liked={final.liked}, '
-					      f'baseline={baseline.liked}).', flush=True)
+				# Counted and cleaned on the account's OWN Likes page, never on the task timeline.
+				# Measured 2026-09-05: the viewport count reported "liked is now 0 (baseline 0)"
+				# while the account actually held 5 — the model had wandered into a reply thread
+				# and liked posts that were never rendered where the old check was looking. A
+				# safety net that can silently miss what it guards is worse than none, because it
+				# is believed.
+				res = await PS.unlike_everything(cdp_url=chrome.cdp_url, host=host,
+				                                 handle=handle, keep=base_liked)
+				cleanup = res
+				if res['removed']:
+					print(f"\n  !! SAFETY NET: removed {res['removed']} leftover like(s) so nothing "
+					      f"accumulates on @{res['handle']}.", flush=True)
+				print(f"  account-wide liked is now {res['remaining']} (baseline {base_liked}) "
+				      f"at {res['url']}", flush=True)
+				if res['remaining'] > base_liked:
+					print(f"     *** {res['remaining'] - base_liked} STILL LIKED — remove them by "
+					      f"hand at {res['url']}", flush=True)
 			except Exception as exc:
 				print(f'\n  *** SAFETY NET FAILED: {type(exc).__name__}: {exc}\n'
-				      f'      CHECK {args.url} BY HAND for leftover likes.', flush=True)
+				      f'      CHECK https://x.com/{handle or "<you>"}/likes BY HAND for leftover '
+				      f'likes.', flush=True)
 		release_lock()
 		print(f'\n  run dir: {run_dir}', flush=True)
 
